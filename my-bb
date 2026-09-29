@@ -1,0 +1,1479 @@
+#!/bin/dash
+## my-bb -- Backblaze Computer Backup (macOS): the TRUE status, and control.
+##
+## Backblaze's window can say "Paused" while the backend runs, "0 remaining"
+## while the backend counts hundreds, and its menu helper can die silently.
+## The backend's own logs and state files in its data directory tell the truth
+## every time; my-bb reads them, and changes things only through Backblaze's
+## own command line tool, bzcli. It reports on the Mac it runs on.
+
+US="${0##*/}"
+## MY_BB_VERSION names the release these bytes are BASED on -- only a release
+## commit sets it. SCRIPT_COMMIT / SCRIPT_RELEASE are written by
+## '--stamp-version' so a copy with no git beside it still knows its commit.
+MY_BB_VERSION="0.1"
+SCRIPT_COMMIT="d16284e"
+SCRIPT_RELEASE=""
+
+NL='
+'
+TAB=$(printf '\t')
+
+#############################################################################
+## OUTPUT
+#############################################################################
+
+## stdout is the RESULT (the status); stderr is what went wrong and every
+## condition that holds -- so -Q (and a cron run) keeps exactly those.
+QUIET=0; VRB=0; VERYVRB=0; DBG=0; DEEPDBG=0; DRY_RUN=0
+
+say()   { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+msg()   { [ "$QUIET" = 1 ] || printf ' >>> %s\n' "$*"; }
+minor() { [ "$QUIET" = 1 ] || printf '    > %s\n' "$*"; }
+warn()  { printf ' !!! %s\n' "$*" >&2; }
+dbg()   { [ "$DBG" = 1 ] && printf ' ~~~ %s\n' "$*" >&2; return 0; }
+
+## err <code> ["text"] -- the five-digit code finds the line that raised it.
+## Exit 2: "my-bb could not tell", never to be mistaken for exit 1, "the
+## backup has a problem".
+err() {
+	_e_t=""; [ -n "${2:-}" ] && _e_t=": $2"
+	printf 'ERROR %s [2]%s\n' "$1" "$_e_t" >&2
+	exit 2
+}
+
+## run <cmd...> -- echo under -V, print-only under -S; one source for both
+run() {
+	if [ "$DRY_RUN" = 1 ]; then printf ' -S: %s\n' "$*"; return 0; fi
+	[ "$VRB" = 1 ] && printf ' >>> %s\n' "$*" >&2
+	"$@"
+}
+
+#############################################################################
+## VERSION
+#############################################################################
+
+build_id() {
+	_bi=$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)
+	printf '%s' "${_bi:-unknown}"
+}
+
+## The directory holding the REAL file, symlinks resolved: a link in a farm
+## lives in another repo, and git asked from there answers about THAT repo.
+_self_dir() {
+	_sd_p=$0
+	while [ -L "$_sd_p" ]; do
+		_sd_t=$(readlink "$_sd_p") || break
+		case "$_sd_t" in
+			/*) _sd_p=$_sd_t ;;
+			*)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+		esac
+	done
+	(cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
+version_string() {
+	_vs_b=$(build_id)
+	_vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
+	## a repo without the stamped commit is not this tool's repo
+	if [ -n "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ] \
+	   && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+		_vs_d=""
+	fi
+	if [ -z "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ]; then _vs_d=$SCRIPT_RELEASE; fi
+	case "$_vs_d" in
+		*-*-g*)
+			_vs_t=${_vs_d%-*-g*}
+			_vs_n=${_vs_d%-g*}; _vs_n=${_vs_n##*-}
+			if [ "$_vs_n" = 0 ]; then
+				printf '%s %s (%s: the %s tag, build %s)\n' "$US" "$MY_BB_VERSION" "$_vs_d" "$_vs_t" "$_vs_b"
+			else
+				printf '%s %s+%s (%s: %s commit(s) past %s, unreleased, build %s)\n' \
+					"$US" "$MY_BB_VERSION" "$_vs_n" "$_vs_d" "$_vs_n" "$_vs_t" "$_vs_b"
+			fi ;;
+		*)
+			_vs_c=$(git -c safe.directory='*' -C "$(_self_dir)" rev-parse --short HEAD 2>/dev/null)
+			if [ -n "$_vs_c" ]; then
+				printf '%s %s (commit %s, no release tag yet, build %s)\n' "$US" "$MY_BB_VERSION" "$_vs_c" "$_vs_b"
+			elif [ -n "$SCRIPT_COMMIT" ]; then
+				printf '%s %s (commit %s, build %s)\n' "$US" "$MY_BB_VERSION" "$SCRIPT_COMMIT" "$_vs_b"
+			else
+				printf '%s %s (build %s, unstamped)\n' "$US" "$MY_BB_VERSION" "$_vs_b"
+			fi ;;
+	esac
+}
+
+## Record HEAD and git's describe string in this file, then AMEND the commit
+## they belong to. Run it after committing and BEFORE pushing; tag afterwards.
+## The stamped sha lags HEAD by one, which is expected.
+cmd_stamp_version() {
+	_sv_dir=$(_self_dir) || err 00001 "stamp-version: cannot resolve my own directory"
+	_sv_self="$_sv_dir/my-bb"
+	git -C "$_sv_dir" rev-parse --git-dir >/dev/null 2>&1 || err 00002 "stamp-version: not a git checkout"
+	_sv_sha=$(git -C "$_sv_dir" rev-parse --short HEAD 2>/dev/null)
+	[ -n "$_sv_sha" ] || err 00003 "stamp-version: no commit to stamp from"
+	if git -C "$_sv_dir" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 \
+	   && git -C "$_sv_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+		err 00004 "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Commit, stamp, THEN push"
+	fi
+	[ -n "$(git -C "$_sv_dir" show --name-only --format= HEAD -- my-bb 2>/dev/null)" ] \
+		|| err 00005 "stamp-version: HEAD does not touch my-bb -- commit it first"
+	_sv_staged=$(git -C "$_sv_dir" diff --cached --name-only 2>/dev/null)
+	[ -z "$_sv_staged" ] || err 00006 "stamp-version: something is staged -- the amend would fold it in: $_sv_staged"
+	git -C "$_sv_dir" diff --quiet -- my-bb 2>/dev/null || err 00007 "stamp-version: my-bb has uncommitted edits -- commit them first"
+	_sv_desc=$(git -c safe.directory='*' -C "$_sv_dir" describe --tags --long 2>/dev/null)
+	_sv_tmp=$(mktemp "${TMPDIR:-/tmp}/my-bb.stamp.XXXXXX") || err 00008 "stamp-version: mktemp failed"
+	cp -p "$_sv_self" "$_sv_tmp" 2>/dev/null
+	sed -e "s|^SCRIPT_COMMIT=.*|SCRIPT_COMMIT=\"$_sv_sha\"|" \
+	    -e "s|^SCRIPT_RELEASE=.*|SCRIPT_RELEASE=\"$_sv_desc\"|" "$_sv_self" > "$_sv_tmp" \
+		|| { rm -f "$_sv_tmp"; err 00009 "stamp-version: could not rewrite the stamp"; }
+	grep -q "^SCRIPT_COMMIT=\"$_sv_sha\"\$" "$_sv_tmp" \
+		|| { rm -f "$_sv_tmp"; err 00010 "stamp-version: the rewritten file carries no stamp -- refusing to install it"; }
+	mv -f "$_sv_tmp" "$_sv_self" || { rm -f "$_sv_tmp"; err 00011 "stamp-version: could not install the stamped file"; }
+	git -C "$_sv_dir" add -- my-bb || err 00012 "stamp-version: git add failed"
+	git -C "$_sv_dir" commit -q --amend --no-edit || err 00013 "stamp-version: git amend failed"
+	printf 'stamped SCRIPT_COMMIT=%s SCRIPT_RELEASE=%s -- HEAD is now %s\n' \
+		"$_sv_sha" "${_sv_desc:-<no tag yet>}" "$(git -C "$_sv_dir" rev-parse --short HEAD)"
+	printf '  > the stamped sha lags HEAD by one: amending changes it. Tag AFTER this.\n'
+}
+
+#############################################################################
+## CONFIG
+#############################################################################
+
+_default_config_content() {
+	cat <<'_EOF'
+## my-bb configuration -- plain shell, sourced at startup.
+## Print this default with: my-bb --create-config
+
+## ---- the problem conditions ------------------------------------------------
+## Which conditions count. ONE list decides everything a condition does:
+## flagging it in the status, exit status 1, and the mail. A condition left
+## out is still SHOWN as a fact, just never flagged -- e.g. drop "unreadable"
+## on a machine whose skipped files are expected.
+##
+##   stale       the last completed backup is older than LAST_BACKUP_MAX_AGE_IN_HOURS
+##   service     bzserv's heartbeat is older than SERVICE_HEARTBEAT_MAX_AGE_IN_MINUTES
+##   paused      paused for longer than PAUSE_MAX_DURATION_IN_HOURS
+##   helper      the menu bar helper (bzbmenu) is not running
+##   unreadable  the newest pass skipped files it could not read
+##   drives      a selected drive has not been seen for DRIVE_MAX_ABSENCE_IN_DAYS
+##               (Backblaze deletes a drive's backup after 30 days away)
+##   freeze      the account is in "Safety Freeze"
+##   license     the license / billing status is not billing_active
+##   access      bzserv lacks Full Disk Access
+##   upload      uploads failed today
+##   initial     the first backup is not complete after INITIAL_BACKUP_MAX_DELAY_IN_DAYS
+##   check       my-bb's own LaunchAgent (--install) has not run its check
+##               for 2 x CHECK_INTERVAL_IN_MINUTES
+CONDITIONS="stale service paused helper unreadable drives freeze license access upload initial check"
+
+LAST_BACKUP_MAX_AGE_IN_HOURS=26
+SERVICE_HEARTBEAT_MAX_AGE_IN_MINUTES=15
+PAUSE_MAX_DURATION_IN_HOURS=24
+DRIVE_MAX_ABSENCE_IN_DAYS=7
+INITIAL_BACKUP_MAX_DELAY_IN_DAYS=7
+## 'my-bb inherit': with no inherit process running, a progress file that has
+## not changed for this long is reported as stalled instead of watched
+INHERIT_STALL_AFTER_IN_MINUTES=10
+
+## ---- mail --------------------------------------------------------------------
+## Empty: no mail. Otherwise a condition that starts to hold sends ONE mail,
+## and one RESOLVED mail when it clears. A failed send is retried by the next
+## check, never dropped.
+MAIL_TO=
+## The command that sends it, called as
+##     "$NOTIFY_CMD" --mail "$MAIL_TO" <subject> <body>
+## and expected to exit 0 only when the mail went out. Give the full path: a
+## LaunchAgent does not run with your login shell's PATH.
+NOTIFY_CMD=my-notify
+
+## ---- the regular check (--install) -------------------------------------------
+CHECK_INTERVAL_IN_MINUTES=60
+LAUNCHAGENT_LABEL=eu.no-panic.my-bb
+## where the LaunchAgent's own output goes (the directory must exist).
+## Outside /var/log/mine: e.g. "$HOME/Library/Logs/my-bb.log"
+LAUNCHAGENT_LOG="/var/log/mine/$(id -un)/my-bb.log"
+## my-bb's own state: which mails went out, the check's heartbeat, a running
+## inherit. Outside /var/lib/mine: e.g. "$HOME/Library/Application Support/my-bb"
+STATE_DIR="/var/lib/mine/$(id -un)/my-bb"
+
+## ---- Backblaze ---------------------------------------------------------------
+BACKBLAZE_DATA_DIR=/Library/Backblaze.bzpkg/bzdata
+BACKBLAZE_CLI=/Applications/Backblaze.app/Contents/MacOS/bzcli
+
+## ---- what the status lists ------------------------------------------------------
+## Three values each: "<default> <-V> <-VV>"; a number = that many (largest
+## first), all = all. When a view leaves something out, its last line says
+## what and how to see it.
+SHOW_REMAINING_SAMPLE="0 all all"
+SHOW_UNREADABLE_FOLDERS="all all all"
+SHOW_UNREADABLE_FILES_PER_FOLDER="0 10 all"
+SHOW_EVENTS="0 10 50"
+## how many path components name a folder in those lists
+## (4: /Users/me/Library/Mobile Documents)
+SHOW_FOLDER_DEPTH=4
+_EOF
+}
+
+CONFIG_FILE=""
+CONFIG_SITE_DIR=/LINKS/default
+
+## Where a config is looked for, in order; the missing-config offer is FILTERED
+## from this same list, so it can never name a file my-bb would not read.
+config_search_paths() {
+	printf '%s\n' "$CONFIG_SITE_DIR/my-bb.conf" "$CONFIG_SITE_DIR/my-bb" \
+		"$HOME/.my-bb.conf" /etc/my-bb.conf /usr/local/etc/my-bb.conf
+}
+
+config_offer_paths() {
+	_co_all=$(config_search_paths)
+	for _co_p in "$CONFIG_SITE_DIR/my-bb.conf" /etc/my-bb.conf "$HOME/.my-bb.conf"; do
+		printf '%s\n' "$_co_all" | grep -qxF "$_co_p" && printf '%s\n' "$_co_p"
+	done
+	return 0
+}
+
+config_find() {
+	if [ -n "${MY_BB_CONFIG:-}" ]; then printf '%s\n' "$MY_BB_CONFIG"; return 0; fi
+	if [ -n "$CONFIG_FILE" ]; then printf '%s\n' "$CONFIG_FILE"; return 0; fi
+	for _cf in $(config_search_paths); do
+		[ -f "$_cf" ] && { printf '%s\n' "$_cf"; return 0; }
+	done
+	return 1
+}
+
+load_config() {
+	if ! CONFIG_SOURCED=$(config_find); then
+		warn "my-bb needs a config: the thresholds, the mail and the Backblaze paths are yours to set."
+		printf ' --> no config found -- write one, most common place first:\n' >&2
+		for _lc_p in $(config_offer_paths); do
+			printf '     > %s --create-config > %s\n' "$US" "$_lc_p" >&2
+		done
+		printf '     (the full search order: %s --help)\n' "$US" >&2
+		exit 2
+	fi
+	[ -f "$CONFIG_SOURCED" ] || err 00014 "config not found: $CONFIG_SOURCED"
+	# shellcheck source=/dev/null
+	. "$CONFIG_SOURCED" || err 00015 "config failed to load: $CONFIG_SOURCED"
+	dbg "config: $CONFIG_SOURCED"
+	for _lc_k in CONDITIONS LAST_BACKUP_MAX_AGE_IN_HOURS SERVICE_HEARTBEAT_MAX_AGE_IN_MINUTES INHERIT_STALL_AFTER_IN_MINUTES \
+	             PAUSE_MAX_DURATION_IN_HOURS DRIVE_MAX_ABSENCE_IN_DAYS INITIAL_BACKUP_MAX_DELAY_IN_DAYS \
+	             CHECK_INTERVAL_IN_MINUTES LAUNCHAGENT_LABEL STATE_DIR BACKBLAZE_DATA_DIR BACKBLAZE_CLI \
+	             NOTIFY_CMD SHOW_REMAINING_SAMPLE SHOW_UNREADABLE_FOLDERS SHOW_UNREADABLE_FILES_PER_FOLDER \
+	             SHOW_EVENTS SHOW_FOLDER_DEPTH; do
+		eval "_lc_v=\${$_lc_k:-}"
+		[ -n "$_lc_v" ] || err 00016 "$_lc_k is not set in $CONFIG_SOURCED -- '$US --create-config' shows every key"
+	done
+	for _lc_c in $CONDITIONS; do
+		case " $ALL_CONDITIONS " in
+			*" $_lc_c "*) ;;
+			*) err 00017 "CONDITIONS names '$_lc_c', which is not a condition (known: $ALL_CONDITIONS)" ;;
+		esac
+	done
+	BZ=$BACKBLAZE_DATA_DIR
+}
+
+cmd_create_config() {
+	if [ -z "${1:-}" ]; then _default_config_content; return 0; fi
+	[ -e "$1" ] && err 00018 "refusing to overwrite: $1"
+	_default_config_content > "$1" || err 00019 "cannot write: $1"
+	msg "wrote the default config: $1"
+}
+
+ALL_CONDITIONS="stale service paused helper unreadable drives freeze license access upload initial check"
+
+#############################################################################
+## PRIMITIVES
+#############################################################################
+
+now_epoch() { date '+%s'; }
+NOW=$(now_epoch)
+
+## 1790645225108 -> 1790645225
+ms_to_epoch() { case "$1" in ????*) printf '%s\n' "${1%???}" ;; *) printf '0\n' ;; esac; }
+
+file_mtime() { stat -f %m "$1" 2>/dev/null || printf '0\n'; }
+
+## a time as it is shown: HH:MM today, else the date too
+when() {
+	[ "${1:-0}" -gt 0 ] 2>/dev/null || { printf 'never'; return 0; }
+	if [ "$(date -r "$1" '+%Y%m%d')" = "$(date -r "$NOW" '+%Y%m%d')" ]; then
+		date -r "$1" '+%H:%M'
+	else
+		date -r "$1" '+%m-%d %H:%M'
+	fi
+}
+full_time() { date -r "$1" '+%Y-%m-%d %H:%M:%S'; }
+
+## seconds -> 0h31 / 2d3h
+human_age() {
+	_ha=${1:-0}; [ "$_ha" -lt 0 ] && _ha=0
+	_d=$((_ha / 86400)); _h=$((_ha % 86400 / 3600)); _m=$((_ha % 3600 / 60))
+	if [ "$_d" -gt 0 ]; then printf '%dd%dh' "$_d" "$_h"; else printf '%dh%02d' "$_h" "$_m"; fi
+}
+
+## ps etime ([[dd-]hh:]mm:ss) -> seconds
+etime_secs() {
+	printf '%s\n' "$1" | awk -F'[-:]' '{
+		if (NF == 4) print $1*86400 + $2*3600 + $3*60 + $4
+		else if (NF == 3) print $1*3600 + $2*60 + $3
+		else print $1*60 + $2 }'
+}
+
+human_bytes() {
+	awk -v b="${1:-0}" 'BEGIN {
+		split("B KB MB GB TB PB", u, " "); i = 1
+		while (b >= 1000 && i < 6) { b /= 1000; i++ }
+		if (i == 1) printf "%d B", b; else printf "%.1f %s", b, u[i] }'
+}
+
+## 187936 -> 187,936
+human_count() {
+	awk -v n="${1:-0}" 'BEGIN { s = sprintf("%d", n); o = ""
+		while (length(s) > 3) { o = "," substr(s, length(s) - 2) o; s = substr(s, 1, length(s) - 3) }
+		print s o }'
+}
+
+## xml_attr <file> <element> <attr>: the attribute of the FIRST such element
+xml_attr() {
+	[ -r "$1" ] || return 0
+	awk -v e="<$2 " -v a=" $3=\"" 'index($0, e) {
+		i = index($0, a); if (!i) next
+		s = substr($0, i + length(a)); print substr(s, 1, index(s, "\"") - 1); exit }' "$1"
+}
+
+## the level-th of three SHOW_* values ("0 10 all") -> a number, 999999 = all
+show_n() {
+	_sn_lvl=1; [ "$VRB" = 1 ] && _sn_lvl=2; [ "$VERYVRB" = 1 ] && _sn_lvl=3
+	_sn_v=0
+	# shellcheck disable=SC2086  # the three values are split on purpose
+	set -- $1
+	eval "_sn_v=\${$_sn_lvl:-0}"
+	case "$_sn_v" in all) printf '999999\n' ;; *[!0-9]*|'') printf '0\n' ;; *) printf '%s\n' "$_sn_v" ;; esac
+}
+
+## the output of ps, or a canned one for the tests
+ps_lines() {
+	if [ -n "${MY_BB_TEST_PS:-}" ]; then cat "$MY_BB_TEST_PS"; return 0; fi
+	ps -axo pid=,etime=,command= 2>/dev/null
+}
+
+## proc <name> -> "pid etime" of the first process whose program is <name>
+proc() {
+	ps_lines | awk -v n="$1" '{ c = $3; sub(/.*\//, "", c); if (c == n) { print $1, $2; exit } }'
+}
+
+## the newest bztransmit logs, newest first
+bztransmit_logs() {
+	# shellcheck disable=SC2012  # plain names in Backblaze's own directory
+	ls -t "$BZ"/bzlogs/bztransmit/bztransmit*.log 2>/dev/null | head -n "${1:-2}"
+}
+
+## the newest event logs, newest first
+eventlogs() {
+	# shellcheck disable=SC2012  # plain names in Backblaze's own directory
+	ls -t "$BZ"/bzlogs/bzreports_eventlog/*.log 2>/dev/null | head -n "${1:-1}"
+}
+
+## "2026-09-29 02:38:55.128" (UTC, as Backblaze logs) -> epoch
+utc_to_epoch() {
+	date -j -u -f '%Y-%m-%d %H:%M:%S' "$(printf '%s' "$1" | cut -c1-19)" '+%s' 2>/dev/null || printf '0\n'
+}
+
+state_dir() {
+	mkdir -p "$STATE_DIR" 2>/dev/null || err 00020 "cannot create STATE_DIR '$STATE_DIR' -- set STATE_DIR in $CONFIG_SOURCED"
+	[ -w "$STATE_DIR" ] || err 00021 "STATE_DIR '$STATE_DIR' is not writable"
+}
+
+## atomic_write <file> <content>
+atomic_write() {
+	printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
+}
+
+#############################################################################
+## GATHER -- every fact, from Backblaze's own files; nothing is written there
+#############################################################################
+
+## The conditions that hold: "<name><TAB><raw value>" per line.
+HOLDS=""
+hold() { HOLDS="$HOLDS$1$TAB$2$NL"; }
+holds() { printf '%s' "$HOLDS" | grep -q "^$1$TAB"; }
+counted() { case " $CONDITIONS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+g_basics() {
+	[ -d "$BZ" ] || err 00022 "no Backblaze data at '$BZ' -- is Backblaze installed? (BACKBLAZE_DATA_DIR in $CONFIG_SOURCED)"
+	[ -r "$BZ/bzinfo.xml" ] || err 00023 "cannot read '$BZ/bzinfo.xml' -- my-bb cannot tell the status"
+	R=$BZ/bzreports
+}
+
+g_last() {
+	F_LAST=$R/bzstat_lastbackupcompleted.xml
+	LAST_EP=$(ms_to_epoch "$(xml_attr "$F_LAST" lastbackupcompleted gmt_millis)")
+	LAST_AGE=$((NOW - LAST_EP))
+	if [ "$LAST_EP" -eq 0 ]; then hold stale "no completed backup recorded"
+	elif [ "$LAST_AGE" -gt $((LAST_BACKUP_MAX_AGE_IN_HOURS * 3600)) ]; then
+		hold stale "last backup $(human_age "$LAST_AGE") ago >${LAST_BACKUP_MAX_AGE_IN_HOURS}h"
+	fi
+}
+
+## mount path of every drive: "<guid><TAB><path><TAB><last seen epoch>"
+g_volumes() {
+	F_VOLS=$BZ/bzvolumes.xml
+	VOLS=$(awk '
+		function hex2str(h,   s, i, c) { s = ""
+			for (i = 1; i < length(h); i += 2) { c = substr(h, i, 2); s = s sprintf("%c", hexv(c)) }
+			return s }
+		function hexv(c,   d, v, i) { v = 0; c = tolower(c)
+			for (i = 1; i <= 2; i++) { d = index("0123456789abcdef", substr(c, i, 1)) - 1; v = v * 16 + d }
+			return v }
+		function attr(a,   i, s) { i = index($0, " " a "=\""); if (!i) return ""
+			s = substr($0, i + length(a) + 3); return substr(s, 1, index(s, "\"") - 1) }
+		/<bzvolume / { p = hex2str(attr("mountPointPathHex")); sub(/\/$/, "", p); if (p == "") p = "/"
+			ms = attr("lastTimeVolumeWasSeenAttachedGmtMillis")
+			print attr("bzVolumeGuid") "\t" p "\t" substr(ms, 1, length(ms) - 3) }' "$F_VOLS" 2>/dev/null)
+}
+
+vol_path() { printf '%s\n' "$VOLS" | awk -F'\t' -v g="$1" '$1 == g { print $2; exit }'; }
+
+## the names in bzlist_filesremaining.txt -- without Backblaze's own
+## "...MORE_FILES..." marker, which ends a list it has cut short
+remaining_sample() { grep -v '^\.\.\.MORE_FILES\.\.\.$' "$F_REMLIST" 2>/dev/null | grep -v '^[[:space:]]*$'; }
+
+g_remaining() {
+	F_REM=$R/bzstat_remainingbackup.xml
+	REM_FILES=$(xml_attr "$F_REM" remaining remainingnumfilesforbackup)
+	REM_BYTES=$(xml_attr "$F_REM" remaining remainingnumbytesforbackup)
+	## per drive, largest first: "<files><TAB><bytes><TAB><guid>"
+	REM_VOLS=$(awk '
+		function attr(a,   i, s) { i = index($0, " " a "=\""); if (!i) return ""
+			s = substr($0, i + length(a) + 3); return substr(s, 1, index(s, "\"") - 1) }
+		/<bzvolume / { f = attr("pervol_remaining_files_numfiles"); if (f + 0 > 0)
+			print f "\t" attr("pervol_remaining_files_numbytes") "\t" attr("bzVolumeGuid") }' "$F_REM" 2>/dev/null \
+		| sort -t "$TAB" -k2,2nr)
+	F_REMLIST=$R/bzlist_filesremaining.txt
+}
+
+g_initial() {
+	F_ENDFIRST=$R/bzstat_endfirstbackupmillis.txt
+	F_STARTFIRST=$R/bzstat_startfirstbackupmillis.txt
+	INIT_DONE_EP=0; [ -r "$F_ENDFIRST" ] && INIT_DONE_EP=$(ms_to_epoch "$(tr -dc 0-9 < "$F_ENDFIRST")")
+	INIT_START_EP=0; [ -r "$F_STARTFIRST" ] && INIT_START_EP=$(ms_to_epoch "$(tr -dc 0-9 < "$F_STARTFIRST")")
+	INIT_LINE=""
+	if [ "$INIT_DONE_EP" -eq 0 ]; then
+		## the newest "declare victory" count, from the logs
+		for _gi_l in $(bztransmit_logs 3); do
+			INIT_LINE=$(grep 'DECLARE VICTORY.*numFilesRemaining=' "$_gi_l" | tail -n 1)
+			[ -n "$INIT_LINE" ] && break
+		done
+		if [ "$INIT_START_EP" -gt 0 ] && [ $((NOW - INIT_START_EP)) -gt $((INITIAL_BACKUP_MAX_DELAY_IN_DAYS * 86400)) ]; then
+			hold initial "first backup not complete after $(human_age $((NOW - INIT_START_EP)))"
+		fi
+	fi
+}
+
+g_pass() {
+	F_OVER=$BZ/overviewstatus.xml
+	PASS_STATE=$(xml_attr "$F_OVER" bztransmit cur_state)
+	PASS_FILE=$(xml_attr "$F_OVER" bztransmit current_file_fullpath)
+	P_TRANSMIT=$(proc bztransmit)
+}
+
+g_pause() {
+	F_PAUSE=$(find "$BZ" -maxdepth 2 -name pauseinfo.xml 2>/dev/null | head -n 1)
+	PAUSED=0
+	if [ -n "$F_PAUSE" ]; then
+		PAUSED=1
+		PAUSE_SINCE=$(file_mtime "$F_PAUSE")
+		PAUSE_UNTIL=$(xml_attr "$F_PAUSE" pauseinfo pauseuntil_localtime_datestr)
+		PAUSE_REASON=$(xml_attr "$F_PAUSE" pauseinfo pauseuntil_reason)
+		[ $((NOW - PAUSE_SINCE)) -gt $((PAUSE_MAX_DURATION_IN_HOURS * 3600)) ] \
+			&& hold paused "paused $(human_age $((NOW - PAUSE_SINCE))) >${PAUSE_MAX_DURATION_IN_HOURS}h"
+	fi
+}
+
+g_drives() {
+	DRV_OLD=$(printf '%s\n' "$VOLS" | awk -F'\t' -v now="$NOW" -v max=$((DRIVE_MAX_ABSENCE_IN_DAYS * 86400)) \
+		'NF >= 3 && now - $3 > max { printf "%s %dd ", $2, (now - $3) / 86400 }')
+	[ -n "$DRV_OLD" ] && hold drives "not seen: ${DRV_OLD% }(>${DRIVE_MAX_ABSENCE_IN_DAYS}d)"
+	DRV_N=$(printf '%s\n' "$VOLS" | awk 'NF { n++ } END { print n + 0 }')
+	DRV_SEEN=$(printf '%s\n' "$VOLS" | awk -F'\t' 'NF >= 3 && $3 > m { m = $3 } END { print m + 0 }')
+}
+
+## Unreadable files. Backblaze starts bzlist_skipped_files.txt afresh with
+## every pass ("# SkippedFilesReportStarted: <local time>"); its bztransmit log
+## line "skipping_DDD: <REASON> - N files" names the count. A log line OLDER
+## than the current report belongs to a pass that is over, and is not counted.
+g_unreadable() {
+	F_SKIP=$R/bzlist_skipped_files.txt
+	UNR_N=0; UNR_REASON=""; UNR_SRC=""; UNR_LIST=""; UNR_SAMPLE=""
+	_gu_start=$(sed -n 's/^# SkippedFilesReportStarted: //p' "$F_SKIP" 2>/dev/null | head -n 1)
+	_gu_start_ep=0
+	[ -n "$_gu_start" ] && _gu_start_ep=$(date -j -f '%Y-%m-%d %H:%M:%S' "$_gu_start" '+%s' 2>/dev/null || printf 0)
+	UNR_LIST=$(grep -v '^#' "$F_SKIP" 2>/dev/null | grep -v '^[[:space:]]*$')
+	for _gu_l in $(bztransmit_logs 2); do
+		_gu_line=$(grep -n 'skipping_DDD: .* - [0-9]* files' "$_gu_l" | tail -n 1)
+		[ -n "$_gu_line" ] || continue
+		_gu_no=${_gu_line%%:*}; _gu_txt=${_gu_line#*:}
+		_gu_ep=$(utc_to_epoch "$_gu_txt")
+		if [ "$_gu_ep" -ge "$_gu_start_ep" ]; then
+			UNR_N=$(printf '%s\n' "$_gu_txt" | sed -n 's/.*skipping_DDD: .* - \([0-9]*\) files.*/\1/p')
+			UNR_REASON=$(printf '%s\n' "$_gu_txt" | sed -n 's/.*skipping_DDD: \([^ ]*\) - .*/\1/p')
+			UNR_SRC="bztransmit $(when "$_gu_ep")"
+			UNR_SAMPLE=$(awk -v s="$_gu_no" 'NR > s { if ($0 ~ /^    \//) { sub(/^    /, ""); print } else exit }' "$_gu_l")
+		fi
+		break
+	done
+	if [ -z "$UNR_SRC" ]; then
+		UNR_N=$(printf '%s' "$UNR_LIST" | awk 'NF { n++ } END { print n + 0 }')
+		UNR_SRC="bzlist_skipped_files $(when "$(file_mtime "$F_SKIP")")"
+	fi
+	## which names we have: the full list, else the log's first ones
+	if [ -n "$UNR_LIST" ]; then UNR_NAMES=$UNR_LIST; UNR_NAMES_OF=""
+	else UNR_NAMES=$UNR_SAMPLE
+		_gu_k=$(printf '%s' "$UNR_SAMPLE" | awk 'NF { n++ } END { print n + 0 }')
+		UNR_NAMES_OF="first $_gu_k of $(human_count "$UNR_N")"
+	fi
+	[ "${UNR_N:-0}" -gt 0 ] && hold unreadable "$(human_count "$UNR_N") files skipped${UNR_REASON:+ ($UNR_REASON)}"
+	return 0
+}
+
+g_client() {
+	F_VER=$R/bzserv_version.txt
+	CLIENT_VER=$(tr -d '\n' < "$F_VER" 2>/dev/null)
+	P_SERV=$(proc bzserv); P_MENU=$(proc bzbmenu)
+	F_HEART=$R/bzserv_heartbeat.txt
+	HEART_EP=0; [ -r "$F_HEART" ] && HEART_EP=$(ms_to_epoch "$(tr -dc 0-9 < "$F_HEART")")
+	HEART_AGE=$((NOW - HEART_EP))
+	if [ "$HEART_EP" -eq 0 ] || [ "$HEART_AGE" -gt $((SERVICE_HEARTBEAT_MAX_AGE_IN_MINUTES * 60)) ]; then
+		hold service "bzserv heartbeat $(human_age "$HEART_AGE") old >${SERVICE_HEARTBEAT_MAX_AGE_IN_MINUTES}m${P_SERV:+, pid ${P_SERV%% *}}${P_SERV:-, not running}"
+	fi
+	[ -n "$P_MENU" ] || hold helper "bzbmenu not running"
+	return 0
+}
+
+g_account() {
+	F_JSON=$R/status.json
+	F_SYNC=$R/bzdc_synchostinfo.xml
+	## ONLY these attributes are read from the host info: it also holds tokens
+	FROZEN=$(awk '/"frozen"/ { gsub(/[^a-z]/, "", $2); print $2; exit }' "$F_JSON" 2>/dev/null)
+	SYNC_FROZEN=$(awk -v a=' safety_frozen="' '{ i = index($0, a); if (i) { s = substr($0, i + length(a)); print substr(s, 1, index(s, "\"") - 1); exit } }' "$F_SYNC" 2>/dev/null)
+	LICENSE=$(awk -v a=' bzlicense_status="' '{ i = index($0, a); if (i) { s = substr($0, i + length(a)); print substr(s, 1, index(s, "\"") - 1); exit } }' "$F_SYNC" 2>/dev/null)
+	if [ "$FROZEN" = true ] || { [ -n "$SYNC_FROZEN" ] && [ "$SYNC_FROZEN" != not_frozen ]; }; then
+		hold freeze "Safety Freeze (frozen=${FROZEN:-?} safety_frozen=${SYNC_FROZEN:-?})"
+	fi
+	[ -n "$LICENSE" ] && [ "$LICENSE" != billing_active ] && hold license "license $LICENSE"
+	F_PERM=$R/bzstat_bzserv_perm.txt
+	PERM=$(tr -d '\n' < "$F_PERM" 2>/dev/null)
+	case "$PERM" in yes*|'') ;; *) hold access "bzserv_perm $PERM" ;; esac
+	return 0
+}
+
+g_upload() {
+	F_UP=$R/bzstat_upload_success.xml
+	## the newest day: "<date> <ok> <failed>"
+	UP_DAY=$(awk '
+		function attr(a,   i, s) { i = index($0, " " a "=\""); if (!i) return 0
+			s = substr($0, i + length(a) + 3); return substr(s, 1, index(s, "\"") - 1) }
+		/<one_upload_success_stat / { d = attr("date_gmt"); ok = attr("num_upload_success")
+			f = attr("num_upload_fail_CvtTooBusy") + attr("num_upload_fail_CvtNoRoom") + attr("num_upload_fail_UnknownReason") }
+		END { if (d != "") print d, ok, f }' "$F_UP" 2>/dev/null)
+	# shellcheck disable=SC2086  # "<date> <ok> <failed>" is split on purpose
+	set -- $UP_DAY
+	UP_DATE=${1:-}; UP_OK=${2:-0}; UP_FAIL=${3:-0}
+	[ "$UP_FAIL" -gt 0 ] && hold upload "$UP_FAIL upload(s) failed on $UP_DATE (UTC)"
+	return 0
+}
+
+g_inherit() {
+	F_IBS=$BZ/bzinherit/bz_ibs_progress.xml
+	INH_STAGE=""; INH_PIECES_BYTES=0; INH_PIECES_N=0
+	[ -r "$F_IBS" ] || return 0
+	INH_STAGE=$(xml_attr "$F_IBS" status inherit_stage)
+	INH_WRITTEN=$(ms_to_epoch "$(xml_attr "$F_IBS" info gmt_millis_this_file_written)")
+	## shellcheck disable=SC2012
+	_gi_sizes=$(find "$BZ/bzinherit" -maxdepth 1 -name '*.ibs' -type f -exec stat -f %z {} + 2>/dev/null)
+	INH_PIECES_N=$(printf '%s\n' "$_gi_sizes" | awk 'NF { n++ } END { print n + 0 }')
+	INH_PIECES_BYTES=$(printf '%s\n' "$_gi_sizes" | awk '{ s += $1 } END { printf "%d", s }')
+	INH_RESULT=$(inherit_result)
+}
+
+## the inherit's result from bztransmit's own log -- the progress file alone is
+## not trusted: it can stay at "600/1000" after a complete success
+inherit_result() {
+	for _ir_l in $(bztransmit_logs 7); do
+		if grep -q 'very successful inherit\|Totally_done' "$_ir_l" 2>/dev/null; then printf 'success\n'; return 0; fi
+	done
+	case "$(xml_attr "$F_IBS" status inherit_stage)" in
+		tbs_done_success) printf 'success\n' ;;
+		tbs_done_failure) printf 'failure\n' ;;
+		*) printf '\n' ;;
+	esac
+}
+
+g_check_heartbeat() {
+	F_CHECKBEAT=$STATE_DIR/check.heartbeat
+	PLIST=$LA_DIR/$LAUNCHAGENT_LABEL.plist
+	[ -f "$PLIST" ] || return 0
+	_gc_ep=$(file_mtime "$F_CHECKBEAT")
+	[ $((NOW - _gc_ep)) -gt $((CHECK_INTERVAL_IN_MINUTES * 120)) ] \
+		&& hold check "my-bb check last ran $( [ "$_gc_ep" -gt 0 ] && printf '%s ago' "$(human_age $((NOW - _gc_ep)))" || printf never ) >$((CHECK_INTERVAL_IN_MINUTES * 2))m"
+	return 0
+}
+
+gather() {
+	g_basics; g_last; g_volumes; g_remaining; g_initial; g_pass; g_pause
+	g_drives; g_unreadable; g_client; g_account; g_upload; g_inherit; g_check_heartbeat
+	## only the conditions the config counts are kept
+	_ga_kept=""
+	while IFS= read -r _ga_l; do
+		[ -n "$_ga_l" ] || continue
+		counted "${_ga_l%%"$TAB"*}" && _ga_kept="$_ga_kept$_ga_l$NL"
+	done <<_EOF
+$HOLDS
+_EOF
+	HOLDS=$_ga_kept
+	dbg "holds: $(printf '%s' "$HOLDS" | cut -f1 | tr '\n' ' ')"
+}
+
+#############################################################################
+## THE STATUS
+#############################################################################
+
+## line <condition|-> <label> <value> <source>
+## A line whose condition HOLDS goes to stderr, its raw value beside it, so
+## -Q keeps it; every other line is the standard output.
+line() {
+	if [ "$1" != - ] && holds "$1"; then
+		_l_raw=$(printf '%s' "$HOLDS" | awk -F'\t' -v c="$1" '$1 == c { print $2; exit }')
+		_l_tag=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+		printf '%-13s %s   %s: %s   [%s]\n' "$2" "$3" "$_l_tag" "$_l_raw" "$4" >&2
+	else
+		[ "$QUIET" = 1 ] || printf '%-13s %-44s [%s]\n' "$2" "$3" "$4"
+	fi
+}
+sub() { [ "$QUIET" = 1 ] || printf '                %s\n' "$*"; }
+
+## folders of a path list, largest first: "<count><TAB><folder>"
+by_folder() {
+	awk -v d="$SHOW_FOLDER_DEPTH" -F/ 'NF {
+		f = ""; for (i = 2; i <= d + 1 && i < NF; i++) f = f "/" $i
+		if (f == "") f = "/"; n[f]++ }
+		END { for (f in n) print n[f] "\t" f }' | sort -t "$TAB" -k1,1nr -k2,2
+}
+
+MORE=""
+more() { MORE="$MORE${MORE:+, }$1"; }
+
+status() {
+	## last backup
+	if [ "$LAST_EP" -gt 0 ]; then
+		line stale "last backup" "$(full_time "$LAST_EP") ($(human_age "$LAST_AGE") ago)" bzstat_lastbackupcompleted
+	else
+		line stale "last backup" "none recorded" bzstat_lastbackupcompleted
+	fi
+
+	## remaining, by drive
+	line - remaining "$(human_count "${REM_FILES:-0}") files / $(human_bytes "${REM_BYTES:-0}")" "bzstat_remainingbackup $(when "$(file_mtime "$F_REM")")"
+	printf '%s\n' "$REM_VOLS" | while IFS="$TAB" read -r _s_f _s_b _s_g; do
+		[ -n "$_s_f" ] || continue
+		sub "$(printf '%9s  %9s  %s' "$(human_count "$_s_f")" "$(human_bytes "$_s_b")" "$(vol_path "$_s_g")")"
+	done
+	_s_total=$(remaining_sample | awk 'NF { n++ } END { print n + 0 }')
+	_s_show=$(show_n "$SHOW_REMAINING_SAMPLE")
+	if [ "${_s_total:-0}" -gt 0 ] && [ "${REM_FILES:-0}" -gt 0 ]; then
+		if [ "$_s_show" -gt 0 ]; then
+			sub "sample of $_s_total of $(human_count "$REM_FILES") (bzlist_filesremaining):"
+			remaining_sample | head -n "$_s_show" | while IFS= read -r _s_n; do sub "  $_s_n"; done
+		else
+			more "a sample of $_s_total remaining file names"
+		fi
+	fi
+
+	## initial backup
+	if [ "$INIT_DONE_EP" -gt 0 ]; then
+		line initial initial "complete $(full_time "$INIT_DONE_EP")" bzstat_endfirstbackupmillis
+	elif [ -n "$INIT_LINE" ]; then
+		_s_n=$(printf '%s\n' "$INIT_LINE" | sed -n 's/.*numFilesRemaining=\([0-9]*\).*/\1/p')
+		line initial initial "NOT declared ($(human_count "$_s_n") left)" "bztransmit $(when "$(utc_to_epoch "$INIT_LINE")")"
+	else
+		line initial initial "NOT complete" bzstat_endfirstbackupmillis
+	fi
+
+	## the pass
+	if [ -n "$P_TRANSMIT" ]; then
+		# shellcheck disable=SC2086  # "<pid> <etime>" is split on purpose
+		set -- $P_TRANSMIT
+		line - pass "running $(human_age "$(etime_secs "$2")"): ${PASS_STATE:-?}" "bztransmit pid $1"
+		[ "$VRB" = 1 ] && [ -n "$PASS_FILE" ] && [ "$PASS_FILE" != none ] && sub "now: $PASS_FILE"
+	else
+		line - pass "none running (${PASS_STATE:-no state})" overviewstatus
+	fi
+
+	## paused
+	if [ "$PAUSED" = 1 ]; then
+		line paused paused "since $(when "$PAUSE_SINCE")${PAUSE_UNTIL:+, until $PAUSE_UNTIL}${PAUSE_REASON:+ ($PAUSE_REASON)}" "${F_PAUSE#"$BZ"/}"
+	else
+		line paused paused no "no pauseinfo.xml"
+	fi
+
+	## drives
+	_s_paths=$(printf '%s\n' "$VOLS" | awk -F'\t' 'NF { printf "%s ", $2 }')
+	line drives drives "$DRV_N: ${_s_paths% }" "bzvolumes, seen $(when "$DRV_SEEN")"
+
+	## unreadable
+	if [ "${UNR_N:-0}" -gt 0 ]; then
+		line unreadable unreadable "$(human_count "$UNR_N") files skipped${UNR_REASON:+ ($UNR_REASON)}" "$UNR_SRC"
+		_s_fo=$(show_n "$SHOW_UNREADABLE_FOLDERS"); _s_fi=$(show_n "$SHOW_UNREADABLE_FILES_PER_FOLDER")
+		[ -n "$UNR_NAMES_OF" ] && sub "folders of the $UNR_NAMES_OF:"
+		_s_folders=$(printf '%s\n' "$UNR_NAMES" | by_folder)
+		_s_nf=$(printf '%s\n' "$_s_folders" | awk 'NF { n++ } END { print n + 0 }')
+		printf '%s\n' "$_s_folders" | head -n "$_s_fo" | while IFS="$TAB" read -r _s_c _s_d; do
+			[ -n "$_s_c" ] || continue
+			sub "$(printf '%9s  %s' "$_s_c" "$_s_d")"
+			[ "$_s_fi" -gt 0 ] && printf '%s\n' "$UNR_NAMES" | grep -F "$_s_d/" | head -n "$_s_fi" | while IFS= read -r _s_x; do sub "             ${_s_x#"$_s_d"/}"; done
+		done
+		[ "$_s_nf" -gt "$_s_fo" ] && more "$((_s_nf - _s_fo)) more unreadable folders"
+		[ "$_s_fi" -eq 0 ] && more "the unreadable file names"
+	else
+		line unreadable unreadable "none" "$UNR_SRC"
+	fi
+
+	## inherit: a running one, or leftover pieces
+	if [ -n "$INH_STAGE" ]; then
+		if [ "$INH_RESULT" = success ]; then
+			[ "$INH_PIECES_N" -gt 0 ] && line - inherit "done $(date -r "$INH_WRITTEN" '+%d.%m'), $(human_bytes "$INH_PIECES_BYTES") of pieces left in bzinherit/ ($INH_PIECES_N .ibs)" bz_ibs_progress
+		elif [ "$INH_RESULT" = failure ]; then
+			line - inherit "FAILED: $(inherit_failure)" bz_ibs_progress
+		elif [ $((NOW - INH_WRITTEN)) -lt 86400 ]; then
+			line - inherit "running: $INH_STAGE -- 'my-bb inherit' watches it" "bz_ibs_progress $(when "$INH_WRITTEN")"
+		fi
+	fi
+
+	## access, account, upload
+	[ -n "$PERM" ] && line access access "${PERM}" bzstat_bzserv_perm
+	line license account "license ${LICENSE:-?}, $( [ "$FROZEN" = true ] && printf 'FROZEN' || printf 'not frozen' )" "status.json, bzdc_synchostinfo"
+	holds freeze && line freeze freeze "Safety Freeze" status.json
+	line upload uploads "${UP_DATE:-?} (UTC): $UP_OK ok, $UP_FAIL failed" bzstat_upload_success
+
+	## client
+	if [ -n "$P_SERV" ]; then _s_serv="bzserv up $(human_age "$(etime_secs "${P_SERV#* }")")"; else _s_serv="bzserv NOT running"; fi
+	if [ -n "$P_MENU" ]; then _s_menu="bzbmenu up"; else _s_menu="bzbmenu NOT running"; fi
+	line service client "${CLIENT_VER:-?}, $_s_serv, heartbeat $(human_age "$HEART_AGE") ago" "ps, bzserv_heartbeat"
+	holds helper && line helper helper "$_s_menu" ps
+	holds check && line check check "the LaunchAgent's check is overdue" "$STATE_DIR"
+
+	## -V extras
+	if [ "$VRB" = 1 ]; then
+		_s_ex=$(grep -c 'whichfiles="none"' "$BZ/bzinfo.xml" 2>/dev/null)
+		line - exclusions "${_s_ex:-0} folders ('my-bb exclusions' lists them)" bzinfo.xml
+	fi
+	_s_ev=$(show_n "$SHOW_EVENTS")
+	if [ "$_s_ev" -gt 0 ]; then
+		_s_evf=$(eventlogs 1)
+		[ -n "$_s_evf" ] && { sub "event log (${_s_evf##*/}):"; tail -n "$_s_ev" "$_s_evf" | while IFS= read -r _s_x; do sub "  $_s_x"; done; }
+	fi
+
+	[ -n "$MORE" ] && [ "$VERYVRB" != 1 ] && say "($MORE: -V)"
+
+	## the one summary line
+	_s_h=$(printf '%s' "$HOLDS" | cut -f1 | awk 'NF { printf "%s ", $0 }')
+	if [ -n "$_s_h" ]; then
+		_s_k=$(printf '%s' "$HOLDS" | awk 'NF { n++ } END { print n + 0 }')
+		printf '!!! %s condition(s) hold: %s[exit 1]\n' "$_s_k" "$_s_h" >&2
+		return 1
+	fi
+	return 0
+}
+
+#############################################################################
+## MAIL -- one mail when a condition starts to hold, one when it clears
+#############################################################################
+
+send_mail() {
+	[ -n "$MAIL_TO" ] || return 3
+	if [ "$DRY_RUN" = 1 ]; then printf ' -S: %s --mail %s "%s" <body>\n' "$NOTIFY_CMD" "$MAIL_TO" "$1"; return 0; fi
+	dbg "$NOTIFY_CMD --mail $MAIL_TO '$1' <body>"
+	"$NOTIFY_CMD" --mail "$MAIL_TO" "$1" "$2"
+}
+
+mail_body() {
+	printf '%s\n\nhost: %s\nuser: %s\ntime: %s\nconfig: %s\n\nThe full status: my-bb (on %s)\n' \
+		"$1" "$(hostname -s)" "$(id -un)" "$(date '+%Y-%m-%d %H:%M:%S')" "$CONFIG_SOURCED" "$(hostname -s)"
+}
+
+## the "sent" state is written ONLY when the mail went out: a failed send is
+## retried by the next check, never dropped
+check_mail() {
+	[ -n "$MAIL_TO" ] || { dbg "MAIL_TO is empty: no mail"; return 0; }
+	_cm_host=$(hostname -s)
+	for _cm_c in $CONDITIONS; do
+		_cm_f=$STATE_DIR/sent.$_cm_c
+		if holds "$_cm_c"; then
+			[ -f "$_cm_f" ] && continue
+			_cm_raw=$(printf '%s' "$HOLDS" | awk -F'\t' -v c="$_cm_c" '$1 == c { print $2; exit }')
+			if send_mail "$_cm_host: $_cm_c -- $_cm_raw" "$(mail_body "Backblaze on $_cm_host: $_cm_c -- $_cm_raw")"; then
+				[ "$DRY_RUN" = 1 ] || atomic_write "$_cm_f" "$_cm_raw" || err 00024 "cannot write '$_cm_f' -- the mail would be sent again"
+				msg "mailed: $_cm_c -- $_cm_raw [rc 0]"
+			else
+				warn "mail NOT sent: $_cm_c -- $_cm_raw [rc $?] -- the next check retries"
+			fi
+		elif [ -f "$_cm_f" ]; then
+			_cm_was=$(cat "$_cm_f")
+			if send_mail "$_cm_host: RESOLVED: $_cm_c" "$(mail_body "Backblaze on $_cm_host: RESOLVED: $_cm_c (was: $_cm_was)")"; then
+				[ "$DRY_RUN" = 1 ] || rm -f "$_cm_f" || err 00025 "cannot remove '$_cm_f'"
+				msg "mailed: RESOLVED: $_cm_c (was: $_cm_was) [rc 0]"
+			else
+				warn "mail NOT sent: RESOLVED $_cm_c [rc $?] -- the next check retries"
+			fi
+		fi
+	done
+	return 0
+}
+
+cmd_test_mail() {
+	[ -n "$MAIL_TO" ] || err 00026 "MAIL_TO is empty in $CONFIG_SOURCED -- a test that passes with mail off would be a lie"
+	send_mail "$(hostname -s): test mail" "$(mail_body "Test mail from my-bb --test-mail, through the path its alerts take.
+via: $NOTIFY_CMD --mail $MAIL_TO")"
+	_tm_rc=$?
+	[ "$_tm_rc" -eq 0 ] || err 00027 "test mail NOT sent to $MAIL_TO [$NOTIFY_CMD rc $_tm_rc]"
+	printf ' >>> test mail sent to %s [rc 0]\n' "$MAIL_TO"
+}
+
+#############################################################################
+## VERBS
+#############################################################################
+
+need_cli() { [ -x "$BACKBLAZE_CLI" ] || err 00028 "bzcli not found at '$BACKBLAZE_CLI' (BACKBLAZE_CLI in $CONFIG_SOURCED)"; }
+
+cmd_start() {
+	need_cli; g_basics; g_pause
+	run "$BACKBLAZE_CLI" action --backup-now || err 00029 "bzcli --backup-now failed [rc $?]"
+	[ "$DRY_RUN" = 1 ] && return 0
+	## a pause ends with it: check that it did
+	if [ "$PAUSED" = 1 ]; then
+		_cs_i=0
+		while [ -f "$F_PAUSE" ] && [ "$_cs_i" -lt 15 ]; do sleep 1; _cs_i=$((_cs_i + 1)); done
+		[ -f "$F_PAUSE" ] && err 00030 "bzcli returned 0 but ${F_PAUSE#"$BZ"/} is still there after ${_cs_i}s -- still paused"
+		msg "started; the pause is over (${F_PAUSE#"$BZ"/} gone after ${_cs_i}s)"
+	else
+		msg "started [bzcli rc 0] -- 'my-bb' shows the pass"
+	fi
+}
+
+cmd_pause() {
+	need_cli; g_basics
+	run "$BACKBLAZE_CLI" action --pause-backup || err 00031 "bzcli --pause-backup failed [rc $?]"
+	[ "$DRY_RUN" = 1 ] && return 0
+	_cp_i=0
+	while [ "$_cp_i" -lt 15 ]; do
+		g_pause; [ "$PAUSED" = 1 ] && break
+		sleep 1; _cp_i=$((_cp_i + 1))
+	done
+	[ "$PAUSED" = 1 ] || err 00032 "bzcli returned 0 but no pauseinfo.xml appeared within ${_cp_i}s -- not confirmed paused"
+	msg "paused (${F_PAUSE#"$BZ"/}${PAUSE_REASON:+, $PAUSE_REASON}) -- 'my-bb start' ends it"
+}
+
+## the stored spelling of an exclusion, matched case-insensitively
+exclusion_stored() {
+	awk -v d="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '/<bzdirfilter / && /whichfiles="none"/ {
+		i = index($0, " dir=\""); s = substr($0, i + 6); s = substr(s, 1, index(s, "\"") - 1)
+		if (tolower(s) == d) { print s; exit } }' "$BZ/bzinfo.xml"
+}
+
+dir_arg() {
+	[ -n "${1:-}" ] || err 00033 "which folder? -- $US $2 <DIR>"
+	case "$1" in /*) ;; *) err 00034 "'$1' is not an absolute path -- Backblaze matches absolute folders" ;; esac
+	printf '%s/\n' "${1%/}"
+}
+
+cmd_exclude() {
+	need_cli; g_basics
+	_ce_d=$(dir_arg "${1:-}" exclude) || exit 2
+	_ce_s=$(exclusion_stored "$_ce_d")
+	[ -n "$_ce_s" ] && { msg "already excluded: $_ce_s"; return 0; }
+	run "$BACKBLAZE_CLI" configure -v "bzdirfilter_add=\"dir\":\"$_ce_d\",\"whichfiles\":\"none\"" \
+		|| err 00035 "bzcli configure failed [rc $?]"
+	[ "$DRY_RUN" = 1 ] && return 0
+	[ -n "$(exclusion_stored "$_ce_d")" ] || err 00036 "bzcli returned 0 but '$_ce_d' is not in bzinfo.xml -- not confirmed excluded"
+	msg "excluded: $_ce_d (confirmed in bzinfo.xml)"
+}
+
+cmd_no_exclude() {
+	need_cli; g_basics
+	_cn_d=$(dir_arg "${1:-}" no-exclude) || exit 2
+	_cn_s=$(exclusion_stored "$_cn_d")
+	[ -n "$_cn_s" ] || { msg "not excluded: $_cn_d ('$US exclusions' lists them)"; return 0; }
+	run "$BACKBLAZE_CLI" configure -v "bzdirfilter_remove=\"dir\":\"$_cn_s\",\"whichfiles\":\"none\"" \
+		|| err 00037 "bzcli configure failed [rc $?]"
+	[ "$DRY_RUN" = 1 ] && return 0
+	[ -z "$(exclusion_stored "$_cn_d")" ] || err 00038 "bzcli returned 0 but '$_cn_s' is still in bzinfo.xml -- not confirmed removed"
+	msg "no longer excluded: $_cn_s (confirmed in bzinfo.xml)"
+}
+
+cmd_exclusions() {
+	g_basics
+	awk '/<bzdirfilter / && /whichfiles="none"/ {
+		i = index($0, " dir=\""); s = substr($0, i + 6); print substr(s, 1, index(s, "\"") - 1) }' "$BZ/bzinfo.xml" | sort
+	msg "$(grep -c 'whichfiles="none"' "$BZ/bzinfo.xml") excluded folders [bzinfo.xml $(when "$(file_mtime "$BZ/bzinfo.xml")")]"
+}
+
+cmd_check() {
+	state_dir
+	gather
+	_ck_rc=0
+	QUIET_WAS=$QUIET; QUIET=1
+	status > /dev/null || _ck_rc=1
+	QUIET=$QUIET_WAS
+	check_mail
+	[ "$DRY_RUN" = 1 ] || touch "$STATE_DIR/check.heartbeat" || err 00039 "cannot write the heartbeat in '$STATE_DIR'"
+	return "$_ck_rc"
+}
+
+#############################################################################
+## INHERIT -- guided and watched; Backblaze's own dialog does the work
+#############################################################################
+
+inherit_failure() {
+	for _if_l in $(bztransmit_logs 7); do
+		_if_x=$(grep -o 'bad username or password\|bad priv_encryption_phrase\|not enough free disk space' "$_if_l" 2>/dev/null | tail -n 1)
+		[ -n "$_if_x" ] && break
+	done
+	case "$_if_x" in
+		*username*) printf 'wrong account password (%s)\n' "$_if_x" ;;
+		*priv_encryption*) printf 'wrong private key (%s)\n' "$_if_x" ;;
+		*disk*) printf 'not enough free disk space (%s)\n' "$_if_x" ;;
+		*) printf 'ibs_final_result=%s, stage %s\n' "$(xml_attr "$F_IBS" status ibs_final_result)" "$(xml_attr "$F_IBS" status inherit_stage)" ;;
+	esac
+}
+
+inherit_running() {
+	ps_lines | grep -q 'inherit_backup_state_fetch_ibs_and_prep_hex\|inherit_backup_state_swap_and_commit'
+}
+
+## no inherit process, and the progress file has not moved for a while
+inherit_stalled() {
+	! inherit_running && [ $((NOW - INH_WRITTEN)) -gt $((INHERIT_STALL_AFTER_IN_MINUTES * 60)) ]
+}
+
+inherit_stall_report() {
+	warn "no inherit is running, and its progress file stopped at $INH_STAGE $(human_age $((NOW - INH_WRITTEN))) ago [bz_ibs_progress $(when "$INH_WRITTEN")]"
+	minor "the bztransmit log holds no result -- the helper that fed the file may have died"
+	minor "'$US diag processes' and the Backblaze window show what is really going on"
+}
+
+cmd_inherit() {
+	g_basics; g_volumes; g_pass; g_client; g_inherit
+	state_dir
+	_ci_state=$STATE_DIR/inherit.state
+	if [ "${1:-}" = cancel ]; then
+		[ -f "$_ci_state" ] || { msg "no inherit state of my-bb to forget"; return 0; }
+		[ "$DRY_RUN" = 1 ] && { printf ' -S: rm %s\n' "$_ci_state"; return 0; }
+		rm -f "$_ci_state" || err 00040 "cannot remove '$_ci_state'"
+		msg "forgot my-bb's inherit state -- Backblaze's own inherit, if any, goes on"
+		return 0
+	fi
+	[ -z "${1:-}" ] || err 00041 "inherit takes nothing or 'cancel', not '$1'"
+
+	## detection: start at the step that is found. The progress file alone is
+	## not trusted: its helper can die and leave it standing, so without a
+	## running inherit a file that has not moved is reported, never watched.
+	if inherit_running || { [ -n "$INH_STAGE" ] && [ -z "$INH_RESULT" ] && ! inherit_stalled; }; then
+		inherit_monitor "$_ci_state"; return $?
+	fi
+	if [ -n "$INH_STAGE" ] && [ -z "$INH_RESULT" ] && [ $((NOW - INH_WRITTEN)) -lt 86400 ]; then
+		inherit_stall_report; return 1
+	fi
+	if [ -n "$INH_RESULT" ] && [ $((NOW - INH_WRITTEN)) -lt 86400 ]; then
+		inherit_report; return $?
+	fi
+
+	## preconditions, each with its raw value
+	msg "preconditions:"
+	printf '%s\n' "$VOLS" | while IFS="$TAB" read -r _ci_g _ci_p _ci_t; do
+		[ -n "$_ci_g" ] || continue
+		if [ -d "$_ci_p" ]; then minor "drive $_ci_p mounted"; else warn "drive $_ci_p NOT mounted -- mount it first"; fi
+	done
+	if [ -n "$P_MENU" ]; then minor "bzbmenu (the menu bar flame) running, pid ${P_MENU%% *}"
+	else warn "bzbmenu NOT running -- open /Library/Backblaze.bzpkg/bzbmenu.app first"; fi
+	minor "client ${CLIENT_VER:-?}"
+	if [ -n "$P_TRANSMIT" ]; then warn "a pass is running (bztransmit pid ${P_TRANSMIT%% *}) -- the inherit waits for it"
+	else minor "no pass running"; fi
+	minor "free on the Backblaze volume: $(df -h "$BZ" 2>/dev/null | awk 'NR == 2 { print $4 }') (the download can be several GB)"
+	msg "then, in Backblaze's MENU BAR item (the flame) -> \"Inherit Backup State...\""
+	minor "not the button on the Settings page -- it has been seen to do nothing"
+	minor "sign in, pick the computer to inherit, enter the private key (PEK)"
+	minor "run '$US inherit' again once it has started: it picks the inherit up and watches it"
+	return 0
+}
+
+inherit_report() {
+	if [ "$INH_RESULT" = success ]; then
+		msg "inherit: SUCCESS [bztransmit log$( [ "$INH_STAGE" != tbs_done_success ] && printf ', the progress file stopped at %s -- not trusted' "$INH_STAGE")]"
+		[ "$INH_PIECES_N" -gt 0 ] && minor "$(human_bytes "$INH_PIECES_BYTES") of downloaded pieces are left in $BZ/bzinherit/ ($INH_PIECES_N .ibs) -- removing them is your call"
+		return 0
+	fi
+	warn "inherit FAILED: $(inherit_failure)"
+	return 1
+}
+
+inherit_monitor() {
+	[ "$DRY_RUN" = 1 ] || atomic_write "$1" "started=$NOW stage=$INH_STAGE" || err 00042 "cannot write '$1'"
+	trap 'printf "\n"; msg "stopped WATCHING -- the inherit goes on; '"'$US inherit'"' picks it up again"; exit 0' INT
+	_im_prev_b=""; _im_prev_t=""
+	while :; do
+		NOW=$(now_epoch); g_inherit
+		_im_b=$(xml_attr "$F_IBS" status num_bytes_downloaded); _im_tot=$(xml_attr "$F_IBS" status tot_num_bytes_in_ibs_file)
+		_im_rate=""; _im_eta=""
+		if [ -n "$_im_prev_b" ] && [ "$NOW" -gt "$_im_prev_t" ] && [ "${_im_b:-0}" -gt "$_im_prev_b" ]; then
+			_im_rate=$(( (_im_b - _im_prev_b) / (NOW - _im_prev_t) ))
+			[ "$_im_rate" -gt 0 ] && [ "${_im_tot:-0}" -gt "$_im_b" ] && _im_eta=$(( (_im_tot - _im_b) / _im_rate ))
+		fi
+		say "$(date '+%H:%M:%S')  ${INH_STAGE:-starting}  $(human_bytes "${_im_b:-0}") / $(human_bytes "${_im_tot:-0}")${_im_rate:+  $(human_bytes "$_im_rate")/s}${_im_eta:+  ETA ~$(human_age "$_im_eta") (estimate)}"
+		[ "$DRY_RUN" = 1 ] || atomic_write "$1" "started=$NOW stage=$INH_STAGE"
+		if [ -n "$INH_RESULT" ] && ! inherit_running; then inherit_report; return $?; fi
+		if [ -z "$INH_RESULT" ] && inherit_stalled; then inherit_stall_report; return 1; fi
+		_im_prev_b=${_im_b:-0}; _im_prev_t=$NOW
+		sleep "${MY_BB_INHERIT_POLL:-5}"
+	done
+}
+
+#############################################################################
+## DIAG -- the building blocks, 1:1
+#############################################################################
+
+cmd_diag() {
+	g_basics
+	case "${1:-}" in
+		'') printf '%s\n' "remaining    files still to back up: per drive, and the sample names" \
+		         "unreadable   files Backblaze skips, by folder/file" \
+		         "events [N]   event-log lines" \
+		         "drives       volume, guid, last seen" \
+		         "passes       START/END of the recent passes, with durations" \
+		         "declare      the 'declare victory' decisions" \
+		         "processes    bzserv / bztransmit / bzfilelist / bzbmenu" \
+		         "files        the state files read, with their mtimes" ;;
+		remaining) g_volumes; g_remaining
+			printf '%s\n' "$REM_VOLS" | while IFS="$TAB" read -r _d_f _d_b _d_g; do
+				[ -n "$_d_f" ] && printf '%s\t%s\t%s\t%s\n' "$_d_f" "$_d_b" "$_d_g" "$(vol_path "$_d_g")"
+			done
+			remaining_sample ;;
+		unreadable) VRB=1; VERYVRB=1; g_unreadable
+			printf 'count\t%s\nreason\t%s\nsource\t%s\n' "$UNR_N" "$UNR_REASON" "$UNR_SRC"
+			printf '%s\n' "$UNR_NAMES" ;;
+		events) _d_f=$(eventlogs 2 | sort)
+			printf '%s\n' "$_d_f" | while IFS= read -r _d_x; do [ -n "$_d_x" ] && cat "$_d_x"; done | tail -n "${2:-50}" ;;
+		drives) g_volumes; printf '%s\n' "$VOLS" | while IFS="$TAB" read -r _d_g _d_p _d_t; do
+				[ -n "$_d_g" ] && printf '%s\t%s\tseen %s\t%s\n' "$_d_p" "$_d_g" "$(full_time "$_d_t")" "$( [ -d "$_d_p" ] && printf mounted || printf ABSENT)"
+			done ;;
+		passes) eventlogs 3 | sort | while IFS= read -r _d_f; do cat "$_d_f"; done \
+			| awk '/STARTBACKUP/ { s = $1 " " $2 } /END_BACKUP/ { print (s ? s : "?") "  ->  " $1 " " $2 "  " substr($0, index($0, "END_BACKUP")); s = "" }' ;;
+		declare) for _d_f in $(bztransmit_logs 7); do grep 'DECLARE VICTORY' "$_d_f"; done | sort | cut -c1-240 ;;
+		processes) ps_lines | grep -E '/bz(serv|transmit|filelist|bmenu)( |$)' ;;
+		files) for _d_f in bzinfo.xml bzvolumes.xml overviewstatus.xml bzreports/bzstat_lastbackupcompleted.xml \
+		                  bzreports/bzstat_remainingbackup.xml bzreports/bzlist_filesremaining.txt bzreports/bzlist_skipped_files.txt \
+		                  bzreports/bzserv_heartbeat.txt bzreports/bzstat_bzserv_perm.txt bzreports/bzstat_upload_success.xml \
+		                  bzreports/status.json bzreports/bzserv_version.txt bzinherit/bz_ibs_progress.xml; do
+				if [ -e "$BZ/$_d_f" ]; then printf '%s\t%s\n' "$(full_time "$(file_mtime "$BZ/$_d_f")")" "$_d_f"
+				else printf 'absent\t\t\t%s\n' "$_d_f"; fi
+			done ;;
+		*) err 00043 "no block '$1' -- '$US diag' lists them" ;;
+	esac
+}
+
+#############################################################################
+## THE LAUNCHAGENT
+#############################################################################
+
+LA_DIR=${MY_BB_TEST_LA_DIR:-$HOME/Library/LaunchAgents}
+LAUNCHCTL=${MY_BB_TEST_LAUNCHCTL:-launchctl}
+
+self_path() {
+	case "$0" in /*) printf '%s\n' "$0" ;; *) printf '%s/%s\n' "$(pwd)" "$0" ;; esac
+}
+
+cmd_install() {
+	_ci_plist=$LA_DIR/$LAUNCHAGENT_LABEL.plist
+	_ci_logdir=$(dirname "$LAUNCHAGENT_LOG")
+	[ -d "$_ci_logdir" ] && [ -w "$_ci_logdir" ] || err 00044 "the log directory '$_ci_logdir' does not exist or is not writable (LAUNCHAGENT_LOG in $CONFIG_SOURCED)"
+	state_dir
+	_ci_self=$(self_path)
+	_ci_content="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+	<key>Label</key><string>$LAUNCHAGENT_LABEL</string>
+	<key>ProgramArguments</key>
+	<array><string>/bin/dash</string><string>$_ci_self</string><string>check</string></array>
+	<key>EnvironmentVariables</key>
+	<dict><key>MY_BB_CONFIG</key><string>$CONFIG_SOURCED</string></dict>
+	<key>StartInterval</key><integer>$((CHECK_INTERVAL_IN_MINUTES * 60))</integer>
+	<key>RunAtLoad</key><true/>
+	<key>StandardOutPath</key><string>$LAUNCHAGENT_LOG</string>
+	<key>StandardErrorPath</key><string>$LAUNCHAGENT_LOG</string>
+</dict>
+</plist>"
+	if [ "$DRY_RUN" = 1 ]; then
+		printf ' -S: write %s, running "%s check" every %s min\n' "$_ci_plist" "$_ci_self" "$CHECK_INTERVAL_IN_MINUTES"
+		printf ' -S: %s bootstrap gui/%s %s\n' "$LAUNCHCTL" "$(id -u)" "$_ci_plist"
+		return 0
+	fi
+	mkdir -p "$LA_DIR" || err 00045 "cannot create '$LA_DIR'"
+	"$LAUNCHCTL" bootout "gui/$(id -u)/$LAUNCHAGENT_LABEL" >/dev/null 2>&1
+	atomic_write "$_ci_plist" "$_ci_content" || err 00046 "cannot write '$_ci_plist'"
+	run "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$_ci_plist" || err 00047 "launchctl bootstrap failed [rc $?] for '$_ci_plist'"
+	"$LAUNCHCTL" print "gui/$(id -u)/$LAUNCHAGENT_LABEL" >/dev/null 2>&1 \
+		|| err 00048 "bootstrap returned 0 but launchd does not know '$LAUNCHAGENT_LABEL'"
+	msg "installed: $LAUNCHAGENT_LABEL runs '$US check' every $CHECK_INTERVAL_IN_MINUTES min (confirmed loaded)"
+	minor "plist $_ci_plist, output $LAUNCHAGENT_LOG, config $CONFIG_SOURCED"
+}
+
+cmd_uninstall() {
+	_cu_plist=$LA_DIR/$LAUNCHAGENT_LABEL.plist
+	[ -f "$_cu_plist" ] || { msg "not installed ($_cu_plist absent)"; return 0; }
+	run "$LAUNCHCTL" bootout "gui/$(id -u)/$LAUNCHAGENT_LABEL" >/dev/null 2>&1
+	[ "$DRY_RUN" = 1 ] && { printf ' -S: rm %s\n' "$_cu_plist"; return 0; }
+	rm -f "$_cu_plist" || err 00049 "cannot remove '$_cu_plist'"
+	msg "uninstalled: $LAUNCHAGENT_LABEL (plist removed, unloaded)"
+}
+
+#############################################################################
+## HELP
+#############################################################################
+
+usage() {
+	cat <<_EOF
+usage: $US [-S] [-Q] [-V|-VV] [-D|-DD] [--config <FILE>] [<VERB> [<ARG>]]
+
+The TRUE status of Backblaze Computer Backup on this Mac, read from its own
+state files and logs; changes go through Backblaze's bzcli only.
+
+VERBS
+  (none)              the status: one line per fact, the raw value and its
+                      source beside each conclusion
+  start               start a backup now (this also ends a pause)
+  pause               pause the backup
+  exclude <DIR>       exclude a folder (through bzcli, confirmed in bzinfo.xml)
+  no-exclude <DIR>    remove that exclusion
+  exclusions          list the excluded folders
+  inherit             guide an "Inherit Backup State", then watch it live;
+                      Ctrl-C stops only the watching
+  inherit cancel      forget my-bb's own inherit state (Backblaze's goes on)
+  check               the problem check, with mail -- what --install runs
+  diag [<BLOCK>]      the building blocks (a bare 'diag' lists them)
+
+MODIFIERS
+  -S                  print the bzcli / launchctl command a verb would run,
+                      and run nothing
+  -Q                  quiet: only conditions and errors (stderr)
+  -V / -VV            more detail (file names, events, the exclusion count)
+  -D / -DD            diagnostics; -DD adds shell tracing
+  --config <FILE>     use this config
+  -h, --help
+
+ADMIN
+  --install / --uninstall   the LaunchAgent that runs 'check' every
+                            CHECK_INTERVAL_IN_MINUTES
+  --create-config [<FILE>]  print the default config, or write it (never over
+                            an existing file)
+  --test-mail         one test mail through the path the alerts take
+  --version           version, commit and build id
+  --run-tests [<FILTER>]    the built-in tests (stubs only: no Backblaze,
+                            no mail)
+  --stamp-version     record the commit in this file (maintainer)
+
+CONDITIONS (the config's CONDITIONS decides which count)
+  stale service paused helper unreadable drives freeze license access
+  upload initial check -- each explained in '$US --create-config'.
+  A condition that holds is printed to stderr with its raw value, and one
+  summary line ends the status.
+
+EXIT
+  0 healthy, 1 a condition holds, 2 $US could not tell (an ERROR)
+
+CONFIG, first found wins
+  \$MY_BB_CONFIG, --config <FILE>, $CONFIG_SITE_DIR/my-bb.conf (or
+  $CONFIG_SITE_DIR/my-bb), ~/.my-bb.conf, /etc/my-bb.conf,
+  /usr/local/etc/my-bb.conf
+_EOF
+}
+
+#############################################################################
+## TESTS
+#############################################################################
+
+## a Backblaze data tree, as observed on a real Mac (2026-09-29), with times
+## relative to now; "t_bz <dir> [variant...]"
+t_bz() {
+	_tb=$1; shift
+	mkdir -p "$_tb/bzreports" "$_tb/bzlogs/bztransmit" "$_tb/bzlogs/bzreports_eventlog" "$_tb/bzinherit"
+	_tb_ms=$(( (NOW - 1800) * 1000 ))
+	cat > "$_tb/bzinfo.xml" <<_EOF
+<bzinfo>
+        <bzdirfilter dir="/users/me/library/mobile documents/" whichfiles="none" />
+        <bzdirfilter dir="/volumes/backup/backups.backupdb/" whichfiles="none" />
+</bzinfo>
+_EOF
+	printf '<contents>\n<lastbackupcompleted gmt_millis="%s" localdatetime="x" />\n</contents>\n' "$_tb_ms" > "$_tb/bzreports/bzstat_lastbackupcompleted.xml"
+	cat > "$_tb/bzreports/bzstat_remainingbackup.xml" <<_EOF
+<contents>
+<remaining remainingnumfilesforbackup="910" remainingnumbytesforbackup="5700000000" />
+<bzvolume bzVolumeGuid="v000" pervol_remaining_files_numfiles="853" pervol_remaining_files_numbytes="5400000000" />
+<bzvolume bzVolumeGuid="v003" pervol_remaining_files_numfiles="57" pervol_remaining_files_numbytes="300000000" />
+</contents>
+_EOF
+	printf '/Users/me/a.log\n/Volumes/stuff/b.log\n...MORE_FILES...\n' > "$_tb/bzreports/bzlist_filesremaining.txt"
+	cat > "$_tb/bzvolumes.xml" <<_EOF
+<contents>
+<bzvolume bzVolumeGuid="v000" mountPointPathHex="2f" lastTimeVolumeWasSeenAttachedGmtMillis="$(( (NOW - 60) * 1000 ))" />
+<bzvolume bzVolumeGuid="v003" mountPointPathHex="2f566f6c756d65732f73747566662f" lastTimeVolumeWasSeenAttachedGmtMillis="$(( (NOW - 60) * 1000 ))" />
+</contents>
+_EOF
+	printf '<status>\n<bztransmit cur_state="transmitting" current_file_fullpath="/x" />\n</status>\n' > "$_tb/overviewstatus.xml"
+	printf '%s\n' "$(( (NOW - 60) * 1000 ))" > "$_tb/bzreports/bzserv_heartbeat.txt"
+	printf 'yes_none' > "$_tb/bzreports/bzstat_bzserv_perm.txt"
+	printf '10.0.3.1076' > "$_tb/bzreports/bzserv_version.txt"
+	printf '%s\n' "$(( (NOW - 86400) * 1000 ))" > "$_tb/bzreports/bzstat_endfirstbackupmillis.txt"
+	printf '{\n    "safety_freeze_status": {\n        "frozen": false\n    }\n}\n' > "$_tb/bzreports/status.json"
+	printf '<x bzlicense_status="billing_active" safety_frozen="not_frozen" bz_auth_token="SECRET" />\n' > "$_tb/bzreports/bzdc_synchostinfo.xml"
+	printf '<u>\n<one_upload_success_stat date_gmt="20260929" num_upload_success="12" num_upload_fail_CvtTooBusy="0" num_upload_fail_CvtNoRoom="0" num_upload_fail_UnknownReason="0" />\n</u>\n' > "$_tb/bzreports/bzstat_upload_success.xml"
+	printf '# SkippedFilesReportStarted: %s\n' "$(date -r $((NOW - 3600)) '+%Y-%m-%d %H:%M:%S')" > "$_tb/bzreports/bzlist_skipped_files.txt"
+	printf '%s - STARTBACKUP\n' "$(date -r $((NOW - 3000)) '+%Y-%m-%d %H:%M:%S')" > "$_tb/bzlogs/bzreports_eventlog/29.log"
+	printf '%s.100      1 - start\n' "$(date -u -r $((NOW - 7200)) '+%Y-%m-%d %H:%M:%S')" > "$_tb/bzlogs/bztransmit/bztransmit29.log"
+	for _tb_v in "$@"; do
+		case "$_tb_v" in
+			stale) printf '<contents>\n<lastbackupcompleted gmt_millis="%s" />\n</contents>\n' "$(( (NOW - 30 * 3600) * 1000 ))" > "$_tb/bzreports/bzstat_lastbackupcompleted.xml" ;;
+			paused) printf '<pauseinfo pauseuntil_gmt_millis="1" pauseuntil_localtime_datestr="2026-10-01 23:00" pauseuntil_reason="action_pause_backup" />\n' > "$_tb/pauseinfo.xml"
+				touch -t "$(date -r $((NOW - 30 * 3600)) '+%Y%m%d%H%M.%S')" "$_tb/pauseinfo.xml" ;;
+			unreadable) { printf '%s.469      57622 - WARNING: could not read file, skipping_DDD: BZ_FILE_TEMPORARY_OTHER - 850 files. The first 10 filepaths:\n' "$(date -u -r $((NOW - 600)) '+%Y-%m-%d %H:%M:%S')"
+				printf '    /Users/me/Library/Mobile Documents/com~apple~CloudDocs/a.txt\n    /Users/me/Library/Mobile Documents/com~apple~CloudDocs/b.txt\n    /Volumes/stuff/gits/c\n'
+				printf '%s.500      57622 - next\n' "$(date -u -r $((NOW - 590)) '+%Y-%m-%d %H:%M:%S')"; } >> "$_tb/bzlogs/bztransmit/bztransmit29.log" ;;
+			old-unreadable) printf '%s.469      57622 - WARNING: could not read file, skipping_DDD: BZ_FILE_TEMPORARY_OTHER - 850 files. The first 10 filepaths:\n    /Users/me/x\n' \
+				"$(date -u -r $((NOW - 7000)) '+%Y-%m-%d %H:%M:%S')" >> "$_tb/bzlogs/bztransmit/bztransmit29.log" ;;
+			service) printf '%s\n' "$(( (NOW - 3600) * 1000 ))" > "$_tb/bzreports/bzserv_heartbeat.txt" ;;
+			drives) printf '<contents>\n<bzvolume bzVolumeGuid="v000" mountPointPathHex="2f" lastTimeVolumeWasSeenAttachedGmtMillis="%s" />\n<bzvolume bzVolumeGuid="v003" mountPointPathHex="2f566f6c756d65732f73747566662f" lastTimeVolumeWasSeenAttachedGmtMillis="%s" />\n</contents>\n' \
+				"$(( (NOW - 60) * 1000 ))" "$(( (NOW - 9 * 86400) * 1000 ))" > "$_tb/bzvolumes.xml" ;;
+			freeze) printf '{\n    "safety_freeze_status": {\n        "frozen": true\n    }\n}\n' > "$_tb/bzreports/status.json" ;;
+			license) printf '<x bzlicense_status="billing_expired_x" safety_frozen="not_frozen" />\n' > "$_tb/bzreports/bzdc_synchostinfo.xml" ;;
+			access) printf 'no_fda' > "$_tb/bzreports/bzstat_bzserv_perm.txt" ;;
+			upload) sed 's/num_upload_fail_UnknownReason="0"/num_upload_fail_UnknownReason="3"/' "$_tb/bzreports/bzstat_upload_success.xml" > "$_tb/x" && mv "$_tb/x" "$_tb/bzreports/bzstat_upload_success.xml" ;;
+			initial) rm -f "$_tb/bzreports/bzstat_endfirstbackupmillis.txt"
+				printf '%s\n' "$(( (NOW - 9 * 86400) * 1000 ))" > "$_tb/bzreports/bzstat_startfirstbackupmillis.txt"
+				printf '%s.000      1 - ATTEMPTING TO DECLARE VICTORY on initial upload processId=1 - after ProduceTodoListOfFilesToBeBackedUp, numFilesRemaining=5736, numBytesRemaining=1\n' \
+					"$(date -u -r $((NOW - 900)) '+%Y-%m-%d %H:%M:%S')" >> "$_tb/bzlogs/bztransmit/bztransmit29.log" ;;
+			inherit-done) printf '<contents>\n<info gmt_millis_this_file_written="%s" />\n<status inherit_stage="tbs_after_files_swap" prog_out_of_thousand="600" ibs_final_result="0" />\n</contents>\n' "$(( (NOW - 3600) * 1000 ))" > "$_tb/bzinherit/bz_ibs_progress.xml"
+				printf '%s.0      1 - very successful inherit\n' "$(date -u -r $((NOW - 3500)) '+%Y-%m-%d %H:%M:%S')" >> "$_tb/bzlogs/bztransmit/bztransmit29.log"
+				dd if=/dev/zero of="$_tb/bzinherit/downld_001.ibs" bs=1000 count=500 2>/dev/null ;;
+			inherit-stalled) printf '<contents>\n<info gmt_millis_this_file_written="%s" />\n<status inherit_stage="tbs_after_files_swap" prog_out_of_thousand="600" ibs_final_result="0" />\n</contents>\n' "$(( (NOW - 3600) * 1000 ))" > "$_tb/bzinherit/bz_ibs_progress.xml" ;;
+		esac
+	done
+}
+
+## the processes of a healthy Mac, as ps prints them
+t_ps() {
+	printf '  20653 01-09:21:42 /Applications/Backblaze.app/Contents/MacOS/bzserv\n  38178 01-05:05:34 /Library/Backblaze.bzpkg/bzbmenu.app/Contents/MacOS/bzbmenu\n  52900       43:21 /Library/Backblaze.bzpkg/bztransmit\n' > "$1"
+}
+
+# shellcheck disable=SC2016  # the test conditions are single-quoted on purpose: t_check evaluates them
+run_tests() {
+	_rt_filter=${1:-}
+	T=$(mktemp -d "${TMPDIR:-/tmp}/my-bb-test.XXXXXX") || err 00050 "mktemp failed"
+	_rt_self=$0; PASS=0; FAIL=0; SKIP=0
+	t_ps "$T/ps"; grep -v bzbmenu "$T/ps" > "$T/ps-nomenu"
+	printf '#!/bin/dash\nprintf "%%s\\n" "$*" >> "%s/bzcli.calls"\ncase "$*" in\n  *bzdirfilter_add=*) d=$(printf "%%s" "$*" | sed -n "s/.*\\"dir\\":\\"\\([^\\"]*\\)\\".*/\\1/p"); printf "        <bzdirfilter dir=\\"%%s\\" whichfiles=\\"none\\" />\\n" "$d" >> "%s/bz/bzinfo.xml" ;;\n  *bzdirfilter_remove=*) d=$(printf "%%s" "$*" | sed -n "s/.*\\"dir\\":\\"\\([^\\"]*\\)\\".*/\\1/p"); grep -vF "dir=\\"$d\\"" "%s/bz/bzinfo.xml" > "%s/x"; mv "%s/x" "%s/bz/bzinfo.xml" ;;\n  *--pause-backup*) printf "<pauseinfo pauseuntil_reason=\\"action_pause_backup\\" />\\n" > "%s/bz/pauseinfo.xml" ;;\n  *--backup-now*) rm -f "%s/bz/pauseinfo.xml" ;;\nesac\nexit 0\n' \
+		"$T" "$T" "$T" "$T" "$T" "$T" "$T" "$T" > "$T/bzcli"
+	printf '#!/bin/dash\n[ -e "%s/mail-fails" ] && exit 7\nprintf "%%s|%%s\\n" "$2" "$3" >> "%s/mails"\n' "$T" "$T" > "$T/notify"
+	printf '#!/bin/dash\nprintf "%%s\\n" "$*" >> "%s/launchctl.calls"\nexit 0\n' "$T" > "$T/launchctl"
+	chmod 755 "$T/bzcli" "$T/notify" "$T/launchctl"
+	mkcfg() {
+		_default_config_content > "$T/conf"
+		printf 'BACKBLAZE_DATA_DIR=%s/bz\nBACKBLAZE_CLI=%s/bzcli\nNOTIFY_CMD=%s/notify\nSTATE_DIR=%s/state\nLAUNCHAGENT_LOG=%s/agent.log\nMAIL_TO=%s\n' \
+			"$T" "$T" "$T" "$T" "$T" "${1:-}" >> "$T/conf"
+		[ -n "${2:-}" ] && printf '%s\n' "$2" >> "$T/conf"
+	}
+	fresh() { rm -rf "$T/bz" "$T/state" "$T/mails" "$T/bzcli.calls" "$T/mail-fails"; t_bz "$T/bz" "$@"; }
+	bb() { MY_BB_CONFIG="$T/conf" MY_BB_TEST_PS="${PSF:-$T/ps}" MY_BB_TEST_LA_DIR="$T/la" MY_BB_TEST_LAUNCHCTL="$T/launchctl" \
+		dash "$_rt_self" "$@" > "$T/out" 2> "$T/errout"; RC=$?; }
+	t_check() {
+		case "$1" in *"$_rt_filter"*) ;; *) SKIP=$((SKIP + 1)); return 0 ;; esac
+		if eval "$2"; then PASS=$((PASS + 1)); printf 'PASS %s\n' "$1"
+		else FAIL=$((FAIL + 1)); printf 'FAIL %s  [rc %s]\n' "$1" "$RC"; sed 's/^/     out| /' "$T/out"; sed 's/^/     err| /' "$T/errout"; fi
+	}
+	# shellcheck disable=SC2329  # used inside the evaluated t_check strings
+	mails() { if [ -e "$T/mails" ]; then grep -c -- "$1" "$T/mails"; else echo 0; fi; }
+
+	mkcfg
+	## healthy
+	fresh; PSF=""; bb
+	t_check "healthy: exit 0"                                '[ "$RC" = 0 ]'
+	t_check "healthy: stderr empty"                          '[ ! -s "$T/errout" ]'
+	t_check "healthy: remaining by drive, with its path"     'grep -q "853 .*5.4 GB .*/$" "$T/out" && grep -q "57 .*/Volumes/stuff" "$T/out"'
+	t_check "healthy: the raw source beside the fact"        'grep -q "last backup .*\[bzstat_lastbackupcompleted\]" "$T/out"'
+	t_check "healthy: sample names offered, not shown"       'grep -q "a sample of 2 remaining file names.*: -V" "$T/out"'
+	t_check "healthy: -V shows the sample, labelled"         'bb -V; grep -q "sample of 2 of 910" "$T/out" && grep -q "/Users/me/a.log" "$T/out"'
+	t_check "healthy: -V and plain differ, -V is a superset" 'bb; cp "$T/out" "$T/plain"; bb -V; ! cmp -s "$T/plain" "$T/out" && grep -c "^last backup\|^remaining\|^drives\|^pass" "$T/out" | grep -q 4'
+	t_check "healthy: -Q prints nothing"                     'bb -Q; [ ! -s "$T/out" ] && [ ! -s "$T/errout" ] && [ "$RC" = 0 ]'
+	t_check "healthy: the auth token is never printed"       'bb -VV; ! grep -q SECRET "$T/out" "$T/errout"'
+	t_check "healthy: the sample count leaves out ...MORE_FILES..." 'bb -V; grep -q "sample of 2 of" "$T/out" && ! grep -q "MORE_FILES" "$T/out"'
+	t_check "healthy: a running bzserv shows its age, not its ps record" 'bb; grep -q "bzserv up 1d9h," "$T/out" && ! grep -q "20653" "$T/out"'
+
+	## every condition, one at a time: flagged on stderr, raw value beside it, exit 1
+	for _rt_c in stale paused unreadable service drives freeze license access upload initial; do
+		fresh "$_rt_c"; bb
+		t_check "$_rt_c: exit 1"                             '[ "$RC" = 1 ]'
+		t_check "$_rt_c: on stderr, with its tag"            'grep -qi "$(printf %s "$_rt_c" | tr "[:lower:]" "[:upper:]"): " "$T/errout"'
+		t_check "$_rt_c: the summary names it"               'grep -q "condition(s) hold: .*$_rt_c" "$T/errout"'
+		t_check "$_rt_c: -Q keeps it"                        'bb -Q; [ ! -s "$T/out" ] && grep -q "hold: .*$_rt_c" "$T/errout"'
+	done
+	fresh; PSF=$T/ps-nomenu; bb; PSF=""
+	t_check "helper: bzbmenu missing holds"                  '[ "$RC" = 1 ] && grep -q "hold: .*helper" "$T/errout"'
+
+	## the adversarial ones
+	fresh old-unreadable; bb
+	t_check "unreadable: a log line older than the current report is over" '[ "$RC" = 0 ] && grep -q "^unreadable .*none" "$T/out"'
+	fresh unreadable; bb -V
+	t_check "unreadable: names labelled as the log's first ones" 'grep -q "folders of the first 3 of 850" "$T/out"'
+	t_check "unreadable: by folder"                          'grep -q "2  /Users/me/Library/Mobile Documents" "$T/out"'
+	fresh stale; mkcfg "" 'CONDITIONS="service paused"'; bb
+	t_check "dropped condition: shown as a fact, not flagged, exit 0" '[ "$RC" = 0 ] && grep -q "^last backup" "$T/out" && [ ! -s "$T/errout" ]'
+	mkcfg "" 'CONDITIONS="stale nonsense"'; bb
+	t_check "config: an unknown condition name is an error (exit 2)" '[ "$RC" = 2 ] && grep -q "ERROR 000.*nonsense" "$T/errout"'
+	mkcfg
+	rm -rf "$T/bz"; bb
+	t_check "no Backblaze: exit 2, not 1"                    '[ "$RC" = 2 ] && grep -q "ERROR" "$T/errout"'
+	MY_BB_CONFIG="" HOME="$T/home" dash "$_rt_self" --config "$T/nope" > "$T/out" 2> "$T/errout"; RC=$?
+	t_check "config: a missing --config is exit 2"           '[ "$RC" = 2 ]'
+	(unset MY_BB_CONFIG; HOME="$T/home" dash "$_rt_self" > "$T/out" 2> "$T/errout"); RC=$?
+	t_check "config: none found offers only searched paths"  'grep -q "create-config >" "$T/errout" && ! grep "create-config >" "$T/errout" | grep -qv "/LINKS/default/my-bb.conf\|/etc/my-bb.conf\|/.my-bb.conf"'
+
+	## mail: once, retried when it failed, RESOLVED when it clears
+	mkcfg to@x
+	fresh stale; bb check
+	t_check "mail: ONE mail when a condition starts to hold" '[ "$(mails "stale -- ")" = 1 ]'
+	bb check
+	t_check "mail: no second mail while it holds"            '[ "$(mails "stale -- ")" = 1 ]'
+	t_check "check: writes its heartbeat"                    '[ -f "$T/state/check.heartbeat" ]'
+	rm -f "$T/mails"; touch "$T/mail-fails"; rm -f "$T/state/sent.stale"; bb check
+	t_check "mail: a failed send leaves no sent state"       '[ ! -f "$T/state/sent.stale" ] && grep -q "mail NOT sent" "$T/errout"'
+	rm -f "$T/mail-fails"; bb check
+	t_check "mail: the next check retries it"                '[ "$(mails "stale -- ")" = 1 ] && [ -f "$T/state/sent.stale" ]'
+	t_TB_state=$T/state; mv "$T/state" "$T/state.keep"; fresh; mv "$T/state.keep" "$t_TB_state"; bb check
+	t_check "mail: ONE RESOLVED mail when it clears"         '[ "$(mails "RESOLVED: stale")" = 1 ] && [ ! -f "$T/state/sent.stale" ]'
+	bb --test-mail
+	t_check "--test-mail: sent, names the recipient, rc 0"   '[ "$RC" = 0 ] && grep -q "test mail sent to to@x \[rc 0\]" "$T/out"'
+	mkcfg; bb --test-mail
+	t_check "--test-mail: mail off is an error, not a pass"  '[ "$RC" = 2 ]'
+
+	## verbs through the bzcli stub
+	fresh; bb exclude /Volumes/stuff/tmp
+	t_check "exclude: through bzcli, confirmed"              'grep -q "bzdirfilter_add=\"dir\":\"/Volumes/stuff/tmp/\"" "$T/bzcli.calls" && grep -q "confirmed in bzinfo.xml" "$T/out"'
+	bb no-exclude "/Users/me/Library/Mobile Documents"
+	t_check "no-exclude: removes the STORED spelling"        'grep -q "bzdirfilter_remove=\"dir\":\"/users/me/library/mobile documents/\"" "$T/bzcli.calls" && [ "$RC" = 0 ]'
+	bb exclude relative/dir
+	t_check "exclude: a relative path is refused"            '[ "$RC" = 2 ]'
+	fresh; bb -S pause
+	t_check "-S: prints the bzcli command, runs nothing"     'grep -q "^ -S: .*bzcli action --pause-backup" "$T/out" && [ ! -e "$T/bzcli.calls" ]'
+	bb pause
+	t_check "pause: confirmed by pauseinfo.xml"              '[ "$RC" = 0 ] && grep -q "^ >>> paused" "$T/out"'
+	bb start
+	t_check "start: ends the pause, confirmed"               '[ "$RC" = 0 ] && grep -q "pause is over" "$T/out" && [ ! -e "$T/bz/pauseinfo.xml" ]'
+	bb --start
+	t_check "a dashed verb names the right form"             '[ "$RC" = 2 ] && grep -q "you mean .my-bb start." "$T/errout"'
+
+	## inherit and leftovers
+	fresh inherit-done; bb
+	t_check "inherit: leftover pieces are a fact"            'grep -q "^inherit .*done .*500.0 KB of pieces left in bzinherit/" "$T/out"'
+	bb inherit
+	t_check "inherit: the log decides success, not the progress file" 'grep -q "SUCCESS .*600\|SUCCESS .*not trusted" "$T/out"'
+	## a progress file left standing by a dead helper, no result in the log, no
+	## process: reported at once -- watching it would never end
+	fresh inherit-stalled; bb inherit
+	t_check "inherit: a stalled progress file is reported, not watched" '[ "$RC" = 1 ] && grep -q "no inherit is running" "$T/errout"'
+
+	## the LaunchAgent and its heartbeat
+	fresh; bb --install
+	t_check "--install: plist written, bootstrapped"         '[ -f "$T/la/eu.no-panic.my-bb.plist" ] && grep -q bootstrap "$T/launchctl.calls"'
+	t_check "--install: runs check with this config"         'grep -q "<string>check</string>" "$T/la/eu.no-panic.my-bb.plist" && grep -q "$T/conf" "$T/la/eu.no-panic.my-bb.plist"'
+	rm -f "$T/state/check.heartbeat"; bb
+	t_check "check: an installed agent that never ran holds" '[ "$RC" = 1 ] && grep -q "hold: .*check" "$T/errout"'
+	bb --uninstall
+	t_check "--uninstall: plist removed"                     '[ ! -f "$T/la/eu.no-panic.my-bb.plist" ]'
+
+	bb --version
+	t_check "--version: names the build"                     'grep -q "^my-bb [0-9].*build [0-9a-f]\{12\}" "$T/out"'
+	bb diag nonsense
+	t_check "diag: an unknown block is exit 2"               '[ "$RC" = 2 ]'
+
+	rm -rf "$T"
+	printf '%s passed, %s failed%s\n' "$PASS" "$FAIL" "$( [ "$SKIP" -gt 0 ] && printf ', %s filtered out' "$SKIP")"
+	[ "$FAIL" -eq 0 ]
+}
+
+#############################################################################
+## MAIN
+#############################################################################
+
+VERB=""; ARG1=""; ARG2=""; ADMIN=""; ADMIN_ARG=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-S) DRY_RUN=1 ;;
+		-Q|--quiet) QUIET=1 ;;
+		-V|--verbose) VRB=1 ;;
+		-VV|--very-verbose) VERYVRB=1 ;;
+		-D|--debug) DBG=1 ;;
+		-DD|--deepdebug) DEEPDBG=1 ;;
+		--config) [ -n "${2:-}" ] || err 00051 "--config needs a file"; CONFIG_FILE=$2; shift ;;
+		--config=*) CONFIG_FILE=${1#--config=} ;;
+		-h|--help) usage; exit 0 ;;
+		--version) version_string; exit 0 ;;
+		--run-tests) ADMIN=run-tests; ADMIN_ARG=${2:-}; [ $# -gt 1 ] && shift ;;
+		--stamp-version) cmd_stamp_version; exit $? ;;
+		--create-config) ADMIN=create-config; case "${2:-}" in ''|-*) ;; *) ADMIN_ARG=$2; shift ;; esac ;;
+		--create-config=*) ADMIN=create-config; ADMIN_ARG=${1#--create-config=} ;;
+		--install|--uninstall|--test-mail) ADMIN=${1#--} ;;
+		--start|--pause|--exclude|--no-exclude|--exclusions|--inherit|--check|--diag|--status)
+			err 00052 "no such option; you mean \`$US ${1#--}\`" ;;
+		--install=*|--uninstall=*) err 00053 "'$1' takes no value" ;;
+		-*) err 00054 "unknown option '$1' -- '$US --help'" ;;
+		*)  if [ -z "$VERB" ]; then VERB=$1
+		    elif [ -z "$ARG1" ]; then ARG1=$1
+		    elif [ -z "$ARG2" ]; then ARG2=$1
+		    else err 00055 "too many arguments: '$1'"; fi ;;
+	esac
+	shift
+done
+
+## each level implies its own counterpart, nothing deeper
+[ "$DEEPDBG" = 1 ] && DBG=1
+[ "$DBG" = 1 ] && VRB=1
+[ "$DEEPDBG" = 1 ] && VERYVRB=1
+[ "$VERYVRB" = 1 ] && VRB=1
+[ "$VRB" = 1 ] && QUIET=0
+[ "$DEEPDBG" = 1 ] && { PS4='+ '; set -x; }
+
+case "$ADMIN" in
+	run-tests) run_tests "$ADMIN_ARG"; exit $? ;;
+	create-config) cmd_create_config "$ADMIN_ARG"; exit 0 ;;
+esac
+
+load_config
+
+case "$ADMIN" in
+	install) cmd_install; exit $? ;;
+	uninstall) cmd_uninstall; exit $? ;;
+	test-mail) cmd_test_mail; exit $? ;;
+esac
+
+case "$VERB" in
+	'') gather; status; exit $? ;;
+	start) cmd_start ;;
+	pause) cmd_pause ;;
+	exclude) cmd_exclude "$ARG1" ;;
+	no-exclude) cmd_no_exclude "$ARG1" ;;
+	exclusions) cmd_exclusions ;;
+	inherit) cmd_inherit "$ARG1" ;;
+	check) cmd_check; exit $? ;;
+	diag) cmd_diag "$ARG1" "$ARG2" ;;
+	status) err 00056 "the status is '$US' with no verb" ;;
+	*) err 00057 "no verb '$VERB' -- '$US --help' lists them" ;;
+esac
