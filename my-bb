@@ -12,7 +12,7 @@ US="${0##*/}"
 ## commit sets it. SCRIPT_COMMIT / SCRIPT_RELEASE are written by
 ## '--stamp-version' so a copy with no git beside it still knows its commit.
 MY_BB_VERSION="0.1"
-SCRIPT_COMMIT="d16284e"
+SCRIPT_COMMIT="6fdecb0"
 SCRIPT_RELEASE=""
 
 NL='
@@ -72,15 +72,23 @@ _self_dir() {
 	(cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
 }
 
+## git is asked only where my-bb OWNS the repository: the directory holding
+## the real file must be the top of its work tree. A copy inside another repo
+## (a container that mirrors it, a checkout of something else) would get THAT
+## repo's commit and tags -- a stranger's release, reported as my-bb's.
+own_git() {
+	_og_d=$(_self_dir)
+	[ -n "$_og_d" ] && [ "$(git -c safe.directory='*' -C "$_og_d" rev-parse --show-toplevel 2>/dev/null)" = "$_og_d" ]
+}
+
 version_string() {
 	_vs_b=$(build_id)
-	_vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
-	## a repo without the stamped commit is not this tool's repo
-	if [ -n "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ] \
-	   && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
-		_vs_d=""
+	_vs_d=""; _vs_c=""
+	if own_git; then
+		_vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
+		_vs_c=$(git -c safe.directory='*' -C "$(_self_dir)" rev-parse --short HEAD 2>/dev/null)
 	fi
-	if [ -z "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ]; then _vs_d=$SCRIPT_RELEASE; fi
+	if [ -z "$_vs_d" ] && [ -z "$_vs_c" ] && [ -n "$SCRIPT_COMMIT" ]; then _vs_d=$SCRIPT_RELEASE; fi
 	case "$_vs_d" in
 		*-*-g*)
 			_vs_t=${_vs_d%-*-g*}
@@ -92,7 +100,6 @@ version_string() {
 					"$US" "$MY_BB_VERSION" "$_vs_n" "$_vs_d" "$_vs_n" "$_vs_t" "$_vs_b"
 			fi ;;
 		*)
-			_vs_c=$(git -c safe.directory='*' -C "$(_self_dir)" rev-parse --short HEAD 2>/dev/null)
 			if [ -n "$_vs_c" ]; then
 				printf '%s %s (commit %s, no release tag yet, build %s)\n' "$US" "$MY_BB_VERSION" "$_vs_c" "$_vs_b"
 			elif [ -n "$SCRIPT_COMMIT" ]; then
@@ -1401,6 +1408,13 @@ run_tests() {
 
 	bb --version
 	t_check "--version: names the build"                     'grep -q "^my-bb [0-9].*build [0-9a-f]\{12\}" "$T/out"'
+	## a copy INSIDE another repo -- as the container mirrors it -- must not
+	## report that repo's commit or tag as its own
+	mkdir -p "$T/foreign/sub" && git -C "$T/foreign" init -q && cp "$_rt_self" "$T/foreign/sub/my-bb" \
+		&& git -C "$T/foreign" add -A && git -C "$T/foreign" -c user.name=t -c user.email=t@t commit -q -m x \
+		&& git -C "$T/foreign" tag v9.9 && _rt_fc=$(git -C "$T/foreign" rev-parse --short HEAD)
+	dash "$T/foreign/sub/my-bb" --version > "$T/out" 2>&1; RC=$?
+	t_check "--version: a copy inside a foreign repo ignores its commit and tags" '! grep -q "$_rt_fc\|v9.9" "$T/out" && grep -q "build [0-9a-f]\{12\}" "$T/out"'
 	bb diag nonsense
 	t_check "diag: an unknown block is exit 2"               '[ "$RC" = 2 ]'
 
