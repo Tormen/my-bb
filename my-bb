@@ -1282,10 +1282,11 @@ t_ps() {
 }
 
 # shellcheck disable=SC2016  # the test conditions are single-quoted on purpose: t_check evaluates them
+# shellcheck disable=SC2329  # the rt_ tests are called by name from the run list, and the helpers from them
 run_tests() {
 	_rt_filter=${1:-}
 	T=$(mktemp -d "${TMPDIR:-/tmp}/my-bb-test.XXXXXX") || err 00050 "mktemp failed"
-	_rt_self=$0; PASS=0; FAIL=0; SKIP=0; _rt_k=0
+	_rt_self=$0; PASS=0; FAIL=0
 	t_ps "$T/ps"; grep -v bzbmenu "$T/ps" > "$T/ps-nomenu"
 	printf '#!/bin/dash\nprintf "%%s\\n" "$*" >> "%s/bzcli.calls"\ncase "$*" in\n  *bzdirfilter_add=*) d=$(printf "%%s" "$*" | sed -n "s/.*\\"dir\\":\\"\\([^\\"]*\\)\\".*/\\1/p"); printf "        <bzdirfilter dir=\\"%%s\\" whichfiles=\\"none\\" />\\n" "$d" >> "%s/bz/bzinfo.xml" ;;\n  *bzdirfilter_remove=*) d=$(printf "%%s" "$*" | sed -n "s/.*\\"dir\\":\\"\\([^\\"]*\\)\\".*/\\1/p"); grep -vF "dir=\\"$d\\"" "%s/bz/bzinfo.xml" > "%s/x"; mv "%s/x" "%s/bz/bzinfo.xml" ;;\n  *--pause-backup*) printf "<pauseinfo pauseuntil_reason=\\"action_pause_backup\\" />\\n" > "%s/bz/pauseinfo.xml" ;;\n  *--backup-now*) rm -f "%s/bz/pauseinfo.xml" ;;\nesac\nexit 0\n' \
 		"$T" "$T" "$T" "$T" "$T" "$T" "$T" "$T" > "$T/bzcli"
@@ -1301,128 +1302,162 @@ run_tests() {
 	fresh() { rm -rf "$T/bz" "$T/state" "$T/mails" "$T/bzcli.calls" "$T/mail-fails"; t_bz "$T/bz" "$@"; }
 	bb() { MY_BB_CONFIG="$T/conf" MY_BB_TEST_PS="${PSF:-$T/ps}" MY_BB_TEST_LA_DIR="$T/la" MY_BB_TEST_LAUNCHCTL="$T/launchctl" \
 		dash "$_rt_self" "$@" > "$T/out" 2> "$T/errout"; RC=$?; }
-	# TAP-style, one line per check: "ok K - title" / "not ok K - title"; the plan "1..N" comes last
 	t_check() {
-		case "$1" in *"$_rt_filter"*) ;; *) SKIP=$((SKIP + 1)); return 0 ;; esac
-		_rt_k=$((_rt_k + 1))
-		if eval "$2"; then PASS=$((PASS + 1)); printf 'ok %s - %s\n' "$_rt_k" "$1"
-		else FAIL=$((FAIL + 1)); printf 'not ok %s - %s  [rc %s]\n' "$_rt_k" "$1" "$RC"; sed 's/^/     out| /' "$T/out"; sed 's/^/     err| /' "$T/errout"; fi
+		if eval "$2"; then PASS=$((PASS + 1)); printf '  PASS %s\n' "$1"
+		else FAIL=$((FAIL + 1)); printf '  FAIL %s  [rc %s]\n' "$1" "$RC"; sed 's/^/     out| /' "$T/out"; sed 's/^/     err| /' "$T/errout"; fi
 	}
 	# shellcheck disable=SC2329  # used inside the evaluated t_check strings
 	mails() { if [ -e "$T/mails" ]; then grep -c -- "$1" "$T/mails"; else echo 0; fi; }
 
-	mkcfg
-	## healthy
-	fresh; PSF=""; bb
-	t_check "healthy: exit 0"                                '[ "$RC" = 0 ]'
-	t_check "healthy: stderr empty"                          '[ ! -s "$T/errout" ]'
-	t_check "healthy: remaining by drive, with its path"     'grep -q "853 .*5.4 GB .*/$" "$T/out" && grep -q "57 .*/Volumes/stuff" "$T/out"'
-	t_check "healthy: the raw source beside the fact"        'grep -q "last backup .*\[bzstat_lastbackupcompleted\]" "$T/out"'
-	t_check "healthy: sample names offered, not shown"       'grep -q "a sample of 2 remaining file names.*: -V" "$T/out"'
-	t_check "healthy: -V shows the sample, labelled"         'bb -V; grep -q "sample of 2 of 910" "$T/out" && grep -q "/Users/me/a.log" "$T/out"'
-	t_check "healthy: -V and plain differ, -V is a superset" 'bb; cp "$T/out" "$T/plain"; bb -V; ! cmp -s "$T/plain" "$T/out" && grep -c "^last backup\|^remaining\|^drives\|^pass" "$T/out" | grep -q 4'
-	t_check "healthy: -Q prints nothing"                     'bb -Q; [ ! -s "$T/out" ] && [ ! -s "$T/errout" ] && [ "$RC" = 0 ]'
-	t_check "healthy: the auth token is never printed"       'bb -VV; ! grep -q SECRET "$T/out" "$T/errout"'
-	t_check "healthy: the sample count leaves out ...MORE_FILES..." 'bb -V; grep -q "sample of 2 of" "$T/out" && ! grep -q "MORE_FILES" "$T/out"'
-	t_check "healthy: a running bzserv shows its age, not its ps record" 'bb; grep -q "bzserv up 1d9h," "$T/out" && ! grep -q "20653" "$T/out"'
+	rt_healthy() {
+		mkcfg
+		## healthy
+		fresh; PSF=""; bb
+		t_check "healthy: exit 0"                                '[ "$RC" = 0 ]'
+		t_check "healthy: stderr empty"                          '[ ! -s "$T/errout" ]'
+		t_check "healthy: remaining by drive, with its path"     'grep -q "853 .*5.4 GB .*/$" "$T/out" && grep -q "57 .*/Volumes/stuff" "$T/out"'
+		t_check "healthy: the raw source beside the fact"        'grep -q "last backup .*\[bzstat_lastbackupcompleted\]" "$T/out"'
+		t_check "healthy: sample names offered, not shown"       'grep -q "a sample of 2 remaining file names.*: -V" "$T/out"'
+		t_check "healthy: -V shows the sample, labelled"         'bb -V; grep -q "sample of 2 of 910" "$T/out" && grep -q "/Users/me/a.log" "$T/out"'
+		t_check "healthy: -V and plain differ, -V is a superset" 'bb; cp "$T/out" "$T/plain"; bb -V; ! cmp -s "$T/plain" "$T/out" && grep -c "^last backup\|^remaining\|^drives\|^pass" "$T/out" | grep -q 4'
+		t_check "healthy: -Q prints nothing"                     'bb -Q; [ ! -s "$T/out" ] && [ ! -s "$T/errout" ] && [ "$RC" = 0 ]'
+		t_check "healthy: the auth token is never printed"       'bb -VV; ! grep -q SECRET "$T/out" "$T/errout"'
+		t_check "healthy: the sample count leaves out ...MORE_FILES..." 'bb -V; grep -q "sample of 2 of" "$T/out" && ! grep -q "MORE_FILES" "$T/out"'
+		t_check "healthy: a running bzserv shows its age, not its ps record" 'bb; grep -q "bzserv up 1d9h," "$T/out" && ! grep -q "20653" "$T/out"'
+	}
 
-	## every condition, one at a time: flagged on stderr, raw value beside it, exit 1
-	for _rt_c in stale paused unreadable service drives freeze license access upload initial; do
-		fresh "$_rt_c"; bb
-		t_check "$_rt_c: exit 1"                             '[ "$RC" = 1 ]'
-		t_check "$_rt_c: on stderr, with its tag"            'grep -qi "$(printf %s "$_rt_c" | tr "[:lower:]" "[:upper:]"): " "$T/errout"'
-		t_check "$_rt_c: the summary names it"               'grep -q "condition(s) hold: .*$_rt_c" "$T/errout"'
-		t_check "$_rt_c: -Q keeps it"                        'bb -Q; [ ! -s "$T/out" ] && grep -q "hold: .*$_rt_c" "$T/errout"'
+	rt_conditions() {
+		mkcfg
+		## every condition, one at a time: flagged on stderr, raw value beside it, exit 1
+		for _rt_c in stale paused unreadable service drives freeze license access upload initial; do
+			fresh "$_rt_c"; bb
+			t_check "$_rt_c: exit 1"                             '[ "$RC" = 1 ]'
+			t_check "$_rt_c: on stderr, with its tag"            'grep -qi "$(printf %s "$_rt_c" | tr "[:lower:]" "[:upper:]"): " "$T/errout"'
+			t_check "$_rt_c: the summary names it"               'grep -q "condition(s) hold: .*$_rt_c" "$T/errout"'
+			t_check "$_rt_c: -Q keeps it"                        'bb -Q; [ ! -s "$T/out" ] && grep -q "hold: .*$_rt_c" "$T/errout"'
+		done
+		fresh; PSF=$T/ps-nomenu; bb; PSF=""
+		t_check "helper: bzbmenu missing holds"                  '[ "$RC" = 1 ] && grep -q "hold: .*helper" "$T/errout"'
+	}
+
+	rt_adversarial() {
+		mkcfg
+		## the adversarial ones
+		fresh old-unreadable; bb
+		t_check "unreadable: a log line older than the current report is over" '[ "$RC" = 0 ] && grep -q "^unreadable .*none" "$T/out"'
+		fresh unreadable; bb -V
+		t_check "unreadable: names labelled as the log's first ones" 'grep -q "folders of the first 3 of 850" "$T/out"'
+		t_check "unreadable: by folder"                          'grep -q "2  /Users/me/Library/Mobile Documents" "$T/out"'
+		fresh stale; mkcfg "" 'CONDITIONS="service paused"'; bb
+		t_check "dropped condition: shown as a fact, not flagged, exit 0" '[ "$RC" = 0 ] && grep -q "^last backup" "$T/out" && [ ! -s "$T/errout" ]'
+		mkcfg "" 'CONDITIONS="stale nonsense"'; bb
+		t_check "config: an unknown condition name is an error (exit 2)" '[ "$RC" = 2 ] && grep -q "ERROR 000.*nonsense" "$T/errout"'
+		mkcfg
+		rm -rf "$T/bz"; bb
+		t_check "no Backblaze: exit 2, not 1"                    '[ "$RC" = 2 ] && grep -q "ERROR" "$T/errout"'
+		MY_BB_CONFIG="" HOME="$T/home" dash "$_rt_self" --config "$T/nope" > "$T/out" 2> "$T/errout"; RC=$?
+		t_check "config: a missing --config is exit 2"           '[ "$RC" = 2 ]'
+		(unset MY_BB_CONFIG; HOME="$T/home" dash "$_rt_self" > "$T/out" 2> "$T/errout"); RC=$?
+		t_check "config: none found offers only searched paths"  'grep -q "create-config >" "$T/errout" && ! grep "create-config >" "$T/errout" | grep -qv "/LINKS/default/my-bb.conf\|/etc/my-bb.conf\|/.my-bb.conf"'
+	}
+
+	rt_mail() {
+		mkcfg
+		## mail: once, retried when it failed, RESOLVED when it clears
+		mkcfg to@x
+		fresh stale; bb check
+		t_check "mail: ONE mail when a condition starts to hold" '[ "$(mails "stale -- ")" = 1 ]'
+		bb check
+		t_check "mail: no second mail while it holds"            '[ "$(mails "stale -- ")" = 1 ]'
+		t_check "check: writes its heartbeat"                    '[ -f "$T/state/check.heartbeat" ]'
+		rm -f "$T/mails"; touch "$T/mail-fails"; rm -f "$T/state/sent.stale"; bb check
+		t_check "mail: a failed send leaves no sent state"       '[ ! -f "$T/state/sent.stale" ] && grep -q "mail NOT sent" "$T/errout"'
+		rm -f "$T/mail-fails"; bb check
+		t_check "mail: the next check retries it"                '[ "$(mails "stale -- ")" = 1 ] && [ -f "$T/state/sent.stale" ]'
+		t_TB_state=$T/state; mv "$T/state" "$T/state.keep"; fresh; mv "$T/state.keep" "$t_TB_state"; bb check
+		t_check "mail: ONE RESOLVED mail when it clears"         '[ "$(mails "RESOLVED: stale")" = 1 ] && [ ! -f "$T/state/sent.stale" ]'
+		bb --test-mail
+		t_check "--test-mail: sent, names the recipient, rc 0"   '[ "$RC" = 0 ] && grep -q "test mail sent to to@x \[rc 0\]" "$T/out"'
+		mkcfg; bb --test-mail
+		t_check "--test-mail: mail off is an error, not a pass"  '[ "$RC" = 2 ]'
+	}
+
+	rt_verbs() {
+		mkcfg
+		## verbs through the bzcli stub
+		fresh; bb exclude /Volumes/stuff/tmp
+		t_check "exclude: through bzcli, confirmed"              'grep -q "bzdirfilter_add=\"dir\":\"/Volumes/stuff/tmp/\"" "$T/bzcli.calls" && grep -q "confirmed in bzinfo.xml" "$T/out"'
+		bb no-exclude "/Users/me/Library/Mobile Documents"
+		t_check "no-exclude: removes the STORED spelling"        'grep -q "bzdirfilter_remove=\"dir\":\"/users/me/library/mobile documents/\"" "$T/bzcli.calls" && [ "$RC" = 0 ]'
+		bb exclude relative/dir
+		t_check "exclude: a relative path is refused"            '[ "$RC" = 2 ]'
+		fresh; bb -S pause
+		t_check "-S: prints the bzcli command, runs nothing"     'grep -q "^ -S: .*bzcli action --pause-backup" "$T/out" && [ ! -e "$T/bzcli.calls" ]'
+		bb pause
+		t_check "pause: confirmed by pauseinfo.xml"              '[ "$RC" = 0 ] && grep -q "^ >>> paused" "$T/out"'
+		bb start
+		t_check "start: ends the pause, confirmed"               '[ "$RC" = 0 ] && grep -q "pause is over" "$T/out" && [ ! -e "$T/bz/pauseinfo.xml" ]'
+		bb --start
+		t_check "a dashed verb names the right form"             '[ "$RC" = 2 ] && grep -q "you mean .my-bb start." "$T/errout"'
+	}
+
+	rt_inherit() {
+		mkcfg
+		## inherit and leftovers
+		fresh inherit-done; bb
+		t_check "inherit: leftover pieces are a fact"            'grep -q "^inherit .*done .*500.0 KB of pieces left in bzinherit/" "$T/out"'
+		bb inherit
+		t_check "inherit: the log decides success, not the progress file" 'grep -q "SUCCESS .*600\|SUCCESS .*not trusted" "$T/out"'
+		## a progress file left standing by a dead helper, no result in the log, no
+		## process: reported at once -- watching it would never end
+		fresh inherit-stalled; bb inherit
+		t_check "inherit: a stalled progress file is reported, not watched" '[ "$RC" = 1 ] && grep -q "no inherit is running" "$T/errout"'
+	}
+
+	rt_agent() {
+		mkcfg
+		## the LaunchAgent and its heartbeat
+		fresh; bb --install
+		t_check "--install: plist written, bootstrapped"         '[ -f "$T/la/eu.no-panic.my-bb.plist" ] && grep -q bootstrap "$T/launchctl.calls"'
+		t_check "--install: runs check with this config"         'grep -q "<string>check</string>" "$T/la/eu.no-panic.my-bb.plist" && grep -q "$T/conf" "$T/la/eu.no-panic.my-bb.plist"'
+		rm -f "$T/state/check.heartbeat"; bb
+		t_check "check: an installed agent that never ran holds" '[ "$RC" = 1 ] && grep -q "hold: .*check" "$T/errout"'
+		bb --uninstall
+		t_check "--uninstall: plist removed"                     '[ ! -f "$T/la/eu.no-panic.my-bb.plist" ]'
+	}
+
+	rt_version() {
+		mkcfg
+		bb --version
+		t_check "--version: names the build"                     'grep -q "^my-bb [0-9].*build [0-9a-f]\{12\}" "$T/out"'
+		## a copy INSIDE another repo -- as the container mirrors it -- must not
+		## report that repo's commit or tag as its own
+		mkdir -p "$T/foreign/sub" && git -C "$T/foreign" init -q && cp "$_rt_self" "$T/foreign/sub/my-bb" \
+			&& git -C "$T/foreign" add -A && git -C "$T/foreign" -c user.name=t -c user.email=t@t commit -q -m x \
+			&& git -C "$T/foreign" tag v9.9 && _rt_fc=$(git -C "$T/foreign" rev-parse --short HEAD)
+		dash "$T/foreign/sub/my-bb" --version > "$T/out" 2>&1; RC=$?
+		t_check "--version: a copy inside a foreign repo ignores its commit and tags" '! grep -q "$_rt_fc\|v9.9" "$T/out" && grep -q "build [0-9a-f]\{12\}" "$T/out"'
+		bb diag nonsense
+		t_check "diag: an unknown block is exit 2"               '[ "$RC" = 2 ]'
+		_rt_def=$(grep -c '^	rt_[a-z]*() {$' "$_rt_self")
+		t_check "suite: every test function is in the run list" '[ "$_rt_def" = "$(echo $_rt_all | wc -w | tr -d " ")" ]'
+	}
+
+	# the tests, in order: one function per area, rt_<area>; the FILTER picks areas.
+	# TAP-style: "1..N" first, then "ok K - area" / "not ok K - area" per test
+	_rt_all="healthy conditions adversarial mail verbs inherit agent version"
+	_rt_n=0
+	for _rt_a in $_rt_all; do case $_rt_a in *"$_rt_filter"*) _rt_n=$((_rt_n + 1)) ;; esac; done
+	echo "1..$_rt_n"
+	_rt_k=0
+	for _rt_a in $_rt_all; do
+		case $_rt_a in *"$_rt_filter"*) ;; *) continue ;; esac
+		_rt_k=$((_rt_k + 1)); _rt_bad=$FAIL
+		"rt_$_rt_a"
+		if [ "$FAIL" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_a"; else echo "not ok $_rt_k - $_rt_a"; fi
 	done
-	fresh; PSF=$T/ps-nomenu; bb; PSF=""
-	t_check "helper: bzbmenu missing holds"                  '[ "$RC" = 1 ] && grep -q "hold: .*helper" "$T/errout"'
-
-	## the adversarial ones
-	fresh old-unreadable; bb
-	t_check "unreadable: a log line older than the current report is over" '[ "$RC" = 0 ] && grep -q "^unreadable .*none" "$T/out"'
-	fresh unreadable; bb -V
-	t_check "unreadable: names labelled as the log's first ones" 'grep -q "folders of the first 3 of 850" "$T/out"'
-	t_check "unreadable: by folder"                          'grep -q "2  /Users/me/Library/Mobile Documents" "$T/out"'
-	fresh stale; mkcfg "" 'CONDITIONS="service paused"'; bb
-	t_check "dropped condition: shown as a fact, not flagged, exit 0" '[ "$RC" = 0 ] && grep -q "^last backup" "$T/out" && [ ! -s "$T/errout" ]'
-	mkcfg "" 'CONDITIONS="stale nonsense"'; bb
-	t_check "config: an unknown condition name is an error (exit 2)" '[ "$RC" = 2 ] && grep -q "ERROR 000.*nonsense" "$T/errout"'
-	mkcfg
-	rm -rf "$T/bz"; bb
-	t_check "no Backblaze: exit 2, not 1"                    '[ "$RC" = 2 ] && grep -q "ERROR" "$T/errout"'
-	MY_BB_CONFIG="" HOME="$T/home" dash "$_rt_self" --config "$T/nope" > "$T/out" 2> "$T/errout"; RC=$?
-	t_check "config: a missing --config is exit 2"           '[ "$RC" = 2 ]'
-	(unset MY_BB_CONFIG; HOME="$T/home" dash "$_rt_self" > "$T/out" 2> "$T/errout"); RC=$?
-	t_check "config: none found offers only searched paths"  'grep -q "create-config >" "$T/errout" && ! grep "create-config >" "$T/errout" | grep -qv "/LINKS/default/my-bb.conf\|/etc/my-bb.conf\|/.my-bb.conf"'
-
-	## mail: once, retried when it failed, RESOLVED when it clears
-	mkcfg to@x
-	fresh stale; bb check
-	t_check "mail: ONE mail when a condition starts to hold" '[ "$(mails "stale -- ")" = 1 ]'
-	bb check
-	t_check "mail: no second mail while it holds"            '[ "$(mails "stale -- ")" = 1 ]'
-	t_check "check: writes its heartbeat"                    '[ -f "$T/state/check.heartbeat" ]'
-	rm -f "$T/mails"; touch "$T/mail-fails"; rm -f "$T/state/sent.stale"; bb check
-	t_check "mail: a failed send leaves no sent state"       '[ ! -f "$T/state/sent.stale" ] && grep -q "mail NOT sent" "$T/errout"'
-	rm -f "$T/mail-fails"; bb check
-	t_check "mail: the next check retries it"                '[ "$(mails "stale -- ")" = 1 ] && [ -f "$T/state/sent.stale" ]'
-	t_TB_state=$T/state; mv "$T/state" "$T/state.keep"; fresh; mv "$T/state.keep" "$t_TB_state"; bb check
-	t_check "mail: ONE RESOLVED mail when it clears"         '[ "$(mails "RESOLVED: stale")" = 1 ] && [ ! -f "$T/state/sent.stale" ]'
-	bb --test-mail
-	t_check "--test-mail: sent, names the recipient, rc 0"   '[ "$RC" = 0 ] && grep -q "test mail sent to to@x \[rc 0\]" "$T/out"'
-	mkcfg; bb --test-mail
-	t_check "--test-mail: mail off is an error, not a pass"  '[ "$RC" = 2 ]'
-
-	## verbs through the bzcli stub
-	fresh; bb exclude /Volumes/stuff/tmp
-	t_check "exclude: through bzcli, confirmed"              'grep -q "bzdirfilter_add=\"dir\":\"/Volumes/stuff/tmp/\"" "$T/bzcli.calls" && grep -q "confirmed in bzinfo.xml" "$T/out"'
-	bb no-exclude "/Users/me/Library/Mobile Documents"
-	t_check "no-exclude: removes the STORED spelling"        'grep -q "bzdirfilter_remove=\"dir\":\"/users/me/library/mobile documents/\"" "$T/bzcli.calls" && [ "$RC" = 0 ]'
-	bb exclude relative/dir
-	t_check "exclude: a relative path is refused"            '[ "$RC" = 2 ]'
-	fresh; bb -S pause
-	t_check "-S: prints the bzcli command, runs nothing"     'grep -q "^ -S: .*bzcli action --pause-backup" "$T/out" && [ ! -e "$T/bzcli.calls" ]'
-	bb pause
-	t_check "pause: confirmed by pauseinfo.xml"              '[ "$RC" = 0 ] && grep -q "^ >>> paused" "$T/out"'
-	bb start
-	t_check "start: ends the pause, confirmed"               '[ "$RC" = 0 ] && grep -q "pause is over" "$T/out" && [ ! -e "$T/bz/pauseinfo.xml" ]'
-	bb --start
-	t_check "a dashed verb names the right form"             '[ "$RC" = 2 ] && grep -q "you mean .my-bb start." "$T/errout"'
-
-	## inherit and leftovers
-	fresh inherit-done; bb
-	t_check "inherit: leftover pieces are a fact"            'grep -q "^inherit .*done .*500.0 KB of pieces left in bzinherit/" "$T/out"'
-	bb inherit
-	t_check "inherit: the log decides success, not the progress file" 'grep -q "SUCCESS .*600\|SUCCESS .*not trusted" "$T/out"'
-	## a progress file left standing by a dead helper, no result in the log, no
-	## process: reported at once -- watching it would never end
-	fresh inherit-stalled; bb inherit
-	t_check "inherit: a stalled progress file is reported, not watched" '[ "$RC" = 1 ] && grep -q "no inherit is running" "$T/errout"'
-
-	## the LaunchAgent and its heartbeat
-	fresh; bb --install
-	t_check "--install: plist written, bootstrapped"         '[ -f "$T/la/eu.no-panic.my-bb.plist" ] && grep -q bootstrap "$T/launchctl.calls"'
-	t_check "--install: runs check with this config"         'grep -q "<string>check</string>" "$T/la/eu.no-panic.my-bb.plist" && grep -q "$T/conf" "$T/la/eu.no-panic.my-bb.plist"'
-	rm -f "$T/state/check.heartbeat"; bb
-	t_check "check: an installed agent that never ran holds" '[ "$RC" = 1 ] && grep -q "hold: .*check" "$T/errout"'
-	bb --uninstall
-	t_check "--uninstall: plist removed"                     '[ ! -f "$T/la/eu.no-panic.my-bb.plist" ]'
-
-	bb --version
-	t_check "--version: names the build"                     'grep -q "^my-bb [0-9].*build [0-9a-f]\{12\}" "$T/out"'
-	## a copy INSIDE another repo -- as the container mirrors it -- must not
-	## report that repo's commit or tag as its own
-	mkdir -p "$T/foreign/sub" && git -C "$T/foreign" init -q && cp "$_rt_self" "$T/foreign/sub/my-bb" \
-		&& git -C "$T/foreign" add -A && git -C "$T/foreign" -c user.name=t -c user.email=t@t commit -q -m x \
-		&& git -C "$T/foreign" tag v9.9 && _rt_fc=$(git -C "$T/foreign" rev-parse --short HEAD)
-	dash "$T/foreign/sub/my-bb" --version > "$T/out" 2>&1; RC=$?
-	t_check "--version: a copy inside a foreign repo ignores its commit and tags" '! grep -q "$_rt_fc\|v9.9" "$T/out" && grep -q "build [0-9a-f]\{12\}" "$T/out"'
-	bb diag nonsense
-	t_check "diag: an unknown block is exit 2"               '[ "$RC" = 2 ]'
-
 	rm -rf "$T"
-	printf '1..%s\n' "$_rt_k"
-	printf '%s passed, %s failed%s\n' "$PASS" "$FAIL" "$( [ "$SKIP" -gt 0 ] && printf ', %s filtered out' "$SKIP")"
+	printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 	[ "$FAIL" -eq 0 ]
 }
 

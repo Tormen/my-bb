@@ -143,5 +143,7 @@ Every key is commented there. The search order, first found wins:
 `/LINKS/default/my-bb`), `~/.my-bb.conf`, `/etc/my-bb.conf`,
 `/usr/local/etc/my-bb.conf`.
 
-`my-bb --run-tests` runs the built-in suite against generated Backblaze data
-trees and stubs: no Backblaze, no mail, no launchd.
+`my-bb --run-tests [<FILTER>]` runs the built-in suite against generated
+Backblaze data trees and stubs: no Backblaze, no mail, no launchd. Its tests
+are its areas -- healthy, conditions, adversarial, mail, verbs, inherit, agent,
+version -- and FILTER runs those whose name contains it.
